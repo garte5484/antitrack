@@ -20,3 +20,11 @@ local.properties
 *.aab
 *.jks
 *.keystore
+
+# Локальные инструменты и исходники иконок
+/tools/
+*.svg
+
+# Ключи подписи (не публиковать)
+/keystore/
+keystore.properties
