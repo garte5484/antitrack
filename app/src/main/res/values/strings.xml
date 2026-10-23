@@ -1,0 +1,47 @@
+<resources>
+    <string name="app_name">AntiTrack</string>
+
+    <string name="vpn_session_name">AntiTrack — блокировка трекеров и рекламы</string>
+    <string name="notification_channel_name">AntiTrack VPN</string>
+    <string name="notification_title">AntiTrack активен</string>
+    <string name="notification_message">Защита включена, блокировки выполняются</string>
+
+    <string name="status_off">Защита выключена</string>
+    <string name="status_on">Защита включена</string>
+    <string name="status_on_all">Трекеры и реклама блокируются</string>
+    <string name="status_on_trackers">Трекеры блокируются</string>
+    <string name="status_on_ads">Реклама блокируется</string>
+    <string name="status_description_off">Включите локальный VPN, чтобы блокировать трекеры и рекламу</string>
+    <string name="status_description_on">Блокировки выполняются при помощи локального VPN</string>
+    <string name="status_description_all">Трекеры и реклама блокируются на уровне DNS при помощи локального VPN</string>
+    <string name="status_description_trackers">Трекеры блокируются на уровне DNS при помощи локального VPN</string>
+    <string name="status_description_ads">Реклама блокируется на уровне DNS при помощи локального VPN</string>
+
+    <string name="toggle_start">Включить защиту</string>
+    <string name="toggle_stop">Выключить защиту</string>
+
+    <string name="settings_button">Настроить</string>
+    <string name="settings_title">Настройки</string>
+    <string name="settings_block_trackers">Блокировать трекеры</string>
+    <string name="settings_block_ads">Блокировать рекламу</string>
+    <string name="settings_list_size">Списки: трекеров — %1$d, рекламных — %2$d</string>
+    <string name="start_guard_hint">Включите блокировку трекеров или рекламы в настройках</string>
+
+    <string name="stats_title">Блокировки по приложениям</string>
+    <string name="tabs_trackers">Трекеры</string>
+    <string name="tabs_ads">Реклама</string>
+    <string name="stats_empty">Пока ничего не заблокировано</string>
+    <string name="stats_reset">Сбросить</string>
+    <string name="stats_usage_access_hint">Для точной статистики разрешите «Доступ к использованию приложений», иначе блокировки будут писаться в «Систему»</string>
+    <string name="dialog_close">Закрыть</string>
+
+    <string name="update_available_title">Доступно обновление</string>
+    <string name="update_available_message">Доступна новая версия %1$s. У вас установлена %2$s.</string>
+    <string name="update_download">Обновить</string>
+    <string name="update_cancel">Отмена</string>
+    <string name="update_downloading_title">Загрузка обновления</string>
+    <string name="update_downloading_message">Скачивается версия %1$s…</string>
+    <string name="update_download_error">Не удалось скачать обновление. Проверьте подключение к интернету.</string>
+    <string name="update_install_permission_hint">Разрешите установку приложений из этого источника, чтобы обновить AntiTrack.</string>
+    <string name="update_install_error">Не удалось открыть установщик обновления.</string>
+</resources>
