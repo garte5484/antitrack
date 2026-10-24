@@ -11,8 +11,8 @@ VPN-сервис, который фильтрует DNS-запросы на ус
 - Пакет: `ru.tapps.trackerblocker.stable`
 - Минимальная версия Android: 7.0 (API 24)
 - Текущая версия: 1.0
-- Репозиторий: <https://github.com/garte5484/antitrack>
-- Релизы: <https://github.com/garte5484/antitrack/releases>
+- Tracker list: <https://github.com/garte5484/alltrackerlist>
+- Advert list: <https://github.com/garte5484/alladlist>
 
 ## Возможности
 
