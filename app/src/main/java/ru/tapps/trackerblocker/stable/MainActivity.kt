@@ -18,6 +18,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -39,6 +40,8 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
@@ -82,6 +85,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import ru.tapps.trackerblocker.stable.ui.theme.AntiTrackTheme
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.io.File
 
 /** Какая вкладка компаний открыта в диалоге приложения. */
@@ -127,6 +133,9 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         BlockStats.init(this)
         AppSettings.init(this)
+        PerAppSettings.init(this)
+        RequestLog.init(this)
+        HostRules.init(this)
         requestNotificationPermissionIfNeeded()
         lifecycleScope.launch {
             withContext(Dispatchers.IO) {
@@ -288,6 +297,12 @@ private fun hasUsageAccess(context: Context): Boolean {
     return mode == AppOpsManager.MODE_ALLOWED
 }
 
+private enum class AppTab(val labelRes: Int, val iconRes: Int) {
+    HOME(R.string.tab_home, R.drawable.ic_tab_home),
+    LOGS(R.string.tab_logs, R.drawable.ic_tab_logs),
+    SETTINGS(R.string.tab_settings, R.drawable.ic_tab_settings)
+}
+
 @Composable
 fun AntiTrackScreen(
     onToggleVpn: () -> Unit,
@@ -301,6 +316,7 @@ fun AntiTrackScreen(
     var blockTrackers by remember { mutableStateOf(AppSettings.blockTrackers()) }
     var blockAds by remember { mutableStateOf(AppSettings.blockAds()) }
     var showSettings by remember { mutableStateOf(false) }
+    var currentTab by remember { mutableStateOf(AppTab.HOME) }
     val context = LocalContext.current
     var usageAccess by remember { mutableStateOf(hasUsageAccess(context)) }
     val stats by BlockStats.state
@@ -350,12 +366,36 @@ fun AntiTrackScreen(
         }
     }
 
-    Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(innerPadding)
-        ) {
+    Scaffold(
+        modifier = Modifier.fillMaxSize(),
+        bottomBar = {
+            NavigationBar {
+                AppTab.entries.forEach { tab ->
+                    NavigationBarItem(
+                        selected = currentTab == tab,
+                        onClick = {
+                            currentTab = tab
+                            selectedApp = null
+                            showSettings = false
+                        },
+                        icon = {
+                            Icon(
+                                painter = painterResource(tab.iconRes),
+                                contentDescription = null
+                            )
+                        },
+                        label = { Text(stringResource(tab.labelRes)) }
+                    )
+                }
+            }
+        }
+    ) { innerPadding ->
+        when (currentTab) {
+            AppTab.HOME -> Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(innerPadding)
+            ) {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -490,6 +530,9 @@ fun AntiTrackScreen(
                 }
             }
         }
+            AppTab.LOGS -> LogsScreen(Modifier.padding(innerPadding))
+            AppTab.SETTINGS -> SettingsPlaceholder(Modifier.padding(innerPadding))
+        }
     }
 
     val dialogApp = selectedApp
@@ -535,11 +578,23 @@ fun AntiTrackScreen(
             CompanyTab.TRACKERS -> trackerRows
             CompanyTab.ADS -> adsRows
         }
+        var blockTrackersForApp by remember(dialogApp) { mutableStateOf(PerAppSettings.isTrackerBlockingEnabled(dialogApp)) }
         AlertDialog(
             onDismissRequest = { selectedApp = null },
             title = { Text(BlockStats.displayName(context, dialogApp)) },
             text = {
                 Column {
+                    if (dialogApp != BlockStats.SYSTEM && dialogApp != BlockStats.OTHER && !dialogApp.startsWith("uid:")) {
+                        SettingsSwitch(
+                            text = "Блокировать трекеры для этого приложения",
+                            checked = blockTrackersForApp,
+                            onCheckedChange = { value ->
+                                blockTrackersForApp = value
+                                PerAppSettings.setTrackerBlockingEnabled(dialogApp, value)
+                            }
+                        )
+                        Spacer(Modifier.height(4.dp))
+                    }
                     if (tabs.size > 1) {
                         TabRow(selectedTabIndex = tabs.indexOf(currentTab).coerceAtLeast(0)) {
                             tabs.forEachIndexed { index, tab ->
@@ -709,6 +764,263 @@ fun AntiTrackScreen(
                     Text(stringResource(R.string.update_cancel))
                 }
             }
+        )
+    }
+}
+
+@Composable
+private fun LogsScreen(modifier: Modifier = Modifier) {
+    val context = LocalContext.current
+    val entries by RequestLog.state
+    var enabled by remember { mutableStateOf(RequestLog.isEnabled) }
+    val timeFormat = remember { SimpleDateFormat("HH:mm:ss", Locale.getDefault()) }
+    val dateFormat = remember { SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault()) }
+    // Названия приложений запрашиваем у PackageManager только когда в логе
+    // появляется новое приложение, а не на каждую новую запись.
+    val packageNames = entries.asSequence()
+        .map { it.packageName }
+        .distinct()
+        .sorted()
+        .toList()
+    val appNames = remember(packageNames) {
+        packageNames.associateWith { BlockStats.displayName(context, it) }
+    }
+    var selectedEntry by remember { mutableStateOf<RequestLog.Entry?>(null) }
+
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .padding(horizontal = 24.dp, vertical = 16.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = stringResource(R.string.logs_title),
+                style = MaterialTheme.typography.headlineSmall,
+                modifier = Modifier.weight(1f)
+            )
+            Button(
+                onClick = {
+                    enabled = !enabled
+                    RequestLog.setEnabled(enabled)
+                }
+            ) {
+                Text(stringResource(if (enabled) R.string.logs_disable else R.string.logs_enable))
+            }
+        }
+
+        Spacer(Modifier.height(4.dp))
+        Text(
+            text = stringResource(R.string.logs_description),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Spacer(Modifier.height(12.dp))
+
+        if (!enabled) {
+            Text(
+                text = stringResource(R.string.logs_disabled),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(24.dp),
+                textAlign = TextAlign.Center
+            )
+        } else {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = stringResource(R.string.logs_count, entries.size),
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f)
+                )
+                if (entries.isNotEmpty()) {
+                    TextButton(onClick = { RequestLog.clear() }) {
+                        Text(stringResource(R.string.logs_clear))
+                    }
+                }
+            }
+
+            if (entries.isEmpty()) {
+                Text(
+                    text = stringResource(R.string.logs_empty),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(24.dp),
+                    textAlign = TextAlign.Center
+                )
+            } else {
+                LazyColumn(modifier = Modifier.fillMaxSize()) {
+                    items(entries, key = { it.id }) { entry ->
+                        LogRow(
+                            entry = entry,
+                            appName = appNames[entry.packageName] ?: entry.packageName,
+                            timeFormat = timeFormat,
+                            onClick = { selectedEntry = entry }
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    val entry = selectedEntry
+    if (entry != null) {
+        val appName = appNames[entry.packageName] ?: entry.packageName
+        val statusText = stringResource(
+            when (entry.status) {
+                RequestLog.Status.ALLOWED -> R.string.log_status_allowed
+                RequestLog.Status.TRACKER -> R.string.log_status_tracker
+                RequestLog.Status.ADS -> R.string.log_status_ads
+                RequestLog.Status.THROTTLE -> R.string.log_status_throttle
+                RequestLog.Status.CUSTOM_BLOCKED -> R.string.log_status_custom_blocked
+            }
+        )
+        val patternText = when (entry.status) {
+            RequestLog.Status.ALLOWED -> stringResource(R.string.logs_details_pattern_none)
+            RequestLog.Status.TRACKER -> "TrackerBlocklist (домен/поддомены/ключевое слово)"
+            RequestLog.Status.ADS -> "AdBlocklist (домен/поддомены/ключевое слово)"
+            RequestLog.Status.THROTTLE -> "Трекер-троттлинг (временный)"
+            RequestLog.Status.CUSTOM_BLOCKED -> "Пользовательское правило (точный хост)"
+        }
+        AlertDialog(
+            onDismissRequest = { selectedEntry = null },
+            title = { Text(stringResource(R.string.logs_details_title)) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    DetailRow(stringResource(R.string.logs_details_host), entry.host)
+                    DetailRow(stringResource(R.string.logs_details_app), appName)
+                    DetailRow(stringResource(R.string.logs_details_time), dateFormat.format(Date(entry.timeMs)))
+                    DetailRow(
+                        stringResource(R.string.logs_details_src_ip),
+                        entry.srcIp ?: stringResource(R.string.logs_unknown_ip)
+                    )
+                    DetailRow(
+                        stringResource(R.string.logs_details_dst_ip),
+                        entry.dstIp ?: stringResource(R.string.logs_unknown_ip)
+                    )
+                    DetailRow(stringResource(R.string.logs_details_status), statusText)
+                    DetailRow(stringResource(R.string.logs_details_pattern), patternText)
+                }
+            },
+            confirmButton = {
+                when (entry.status) {
+                    RequestLog.Status.ALLOWED -> {
+                        Button(onClick = {
+                            HostRules.forceBlock(entry.host)
+                            selectedEntry = null
+                        }) {
+                            Text(stringResource(R.string.logs_block_host, entry.host))
+                        }
+                    }
+                    RequestLog.Status.TRACKER, RequestLog.Status.ADS, RequestLog.Status.THROTTLE, RequestLog.Status.CUSTOM_BLOCKED -> {
+                        Button(onClick = {
+                            HostRules.forceAllow(entry.host)
+                            selectedEntry = null
+                        }) {
+                            Text(stringResource(R.string.logs_allow_host, entry.host))
+                        }
+                    }
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { selectedEntry = null }) {
+                    Text(stringResource(R.string.logs_close))
+                }
+            }
+        )
+    }
+}
+
+@Composable
+private fun DetailRow(label: String, value: String) {
+    Column {
+        Text(label, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Text(value, style = MaterialTheme.typography.bodyMedium)
+    }
+}
+
+@Composable
+private fun LogRow(
+    entry: RequestLog.Entry,
+    appName: String,
+    timeFormat: SimpleDateFormat,
+    onClick: () -> Unit
+) {
+    val statusText = stringResource(
+        when (entry.status) {
+            RequestLog.Status.ALLOWED -> R.string.log_status_allowed
+            RequestLog.Status.TRACKER -> R.string.log_status_tracker
+            RequestLog.Status.ADS -> R.string.log_status_ads
+            RequestLog.Status.THROTTLE -> R.string.log_status_throttle
+            RequestLog.Status.CUSTOM_BLOCKED -> R.string.log_status_custom_blocked
+        }
+    )
+    val statusColor = when (entry.status) {
+        RequestLog.Status.ALLOWED -> colorResource(R.color.active_color)
+        else -> MaterialTheme.colorScheme.error
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onClick() }
+            .padding(vertical = 6.dp)
+    ) {
+        Row(verticalAlignment = Alignment.Top) {
+            Text(
+                text = entry.host,
+                style = MaterialTheme.typography.bodyMedium,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f)
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                text = statusText,
+                style = MaterialTheme.typography.bodySmall,
+                color = statusColor,
+                textAlign = TextAlign.End
+            )
+        }
+        Spacer(Modifier.height(2.dp))
+        Text(
+            text = "$appName · ${timeFormat.format(Date(entry.timeMs))}",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+    }
+}
+
+@Composable
+private fun SettingsPlaceholder(modifier: Modifier = Modifier) {
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .padding(24.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Text(
+            text = stringResource(R.string.tab_settings),
+            style = MaterialTheme.typography.headlineSmall
+        )
+        Spacer(Modifier.height(8.dp))
+        Text(
+            text = stringResource(R.string.settings_placeholder),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center
         )
     }
 }

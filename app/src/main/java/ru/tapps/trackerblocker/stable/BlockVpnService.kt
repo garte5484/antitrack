@@ -73,7 +73,7 @@ class BlockVpnService : VpnService() {
      * [ConnectivityManager.getConnectionOwnerUid] (API 29+): он ищет владельца
      * сокета по паре адресов; если он безуспешен либо версия Android меньше 10,
      * авторство определяется эвристикой «недавняя активность» (API 23+).
-     * Полная цепочка — в [recordBlocked].
+     * Полная цепочка — в [attributedApp].
      *
      * На современных прошивках чужие uid в /proc/net замаскированы, а /proc/uid_stat
      * удалён — единственный легальный источник per-uid активности — [NetworkStatsManager]
@@ -227,6 +227,9 @@ class BlockVpnService : VpnService() {
         createNotificationChannel()
         BlockStats.init(this)
         AppSettings.init(this)
+        PerAppSettings.init(this)
+        RequestLog.init(this)
+        HostRules.init(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -401,21 +404,81 @@ class BlockVpnService : VpnService() {
 
         logAttributionSignals(srcIp, dstIp, srcPort, qname)
 
-        val trackersMatch = AppSettings.blockTrackers() && TrackerBlocklist.isBlocked(qname)
-        val adsMatch = AppSettings.blockAds() && AdBlocklist.isBlocked(qname)
-        val isBlocked = trackersMatch || adsMatch
+        val logging = RequestLog.isEnabled
+        val srcIpStr = srcIp.joinToString(".")
+        val dstIpStr = dstIp.joinToString(".")
 
-        if (isBlocked) {
-            if (isExemptAppRequest(srcIp, dstIp, srcPort)) {
+        // Пользовательские правила работают по точному хосту
+        if (HostRules.isBlocked(qname)) {
+            val appRule = if (AppSettings.blockTrackers() && TrackerBlocklist.isBlocked(qname) ||
+                AppSettings.blockAds() && AdBlocklist.isBlocked(qname) ||
+                logging || activeThrottles > 0
+            ) {
+                attributedApp(srcIp, dstIp, srcPort)
+            } else {
+                null
+            }
+            val owner = appRule ?: BlockStats.OTHER
+            blockedCount.incrementAndGet()
+            BlockStats.record(owner, qname, BlockStats.Kind.TRACKER)
+            Log.d(TAG, "Заблокировано пользователем: $qname")
+            if (logging) RequestLog.record(owner, qname, RequestLog.Status.CUSTOM_BLOCKED, srcIpStr, dstIpStr)
+            buildNxdomainResponse(packet, dnsStart)?.let {
+                writeDnsResponse(srcIp, dstIp, srcPort, it)
+            }
+            return
+        }
+
+        val trackerCandidate = AppSettings.blockTrackers() && TrackerBlocklist.isBlocked(qname)
+        val adsCandidate = AppSettings.blockAds() && AdBlocklist.isBlocked(qname)
+        val hostAllowedByUser = HostRules.isAllowed(qname)
+
+        // Автор запроса нужен для лога, per-app настроек и трекер-троттлинга.
+        val app = if (trackerCandidate || adsCandidate || logging || activeThrottles > 0) {
+            attributedApp(srcIp, dstIp, srcPort)
+        } else {
+            null
+        }
+
+        val trackersMatch = trackerCandidate &&
+            (app == null || PerAppSettings.isTrackerBlockingEnabled(app))
+        val adsMatch = adsCandidate
+
+        if (trackersMatch || adsMatch) {
+            if ((app != null && app in exemptPackages) || isExemptAppRequest(srcIp, dstIp, srcPort)) {
                 Log.d(TAG, "Не блокируем от исключённого приложения: $qname")
             } else {
-                blockedCount.incrementAndGet()
-                val kind = if (trackersMatch) BlockStats.Kind.TRACKER else BlockStats.Kind.ADS
-                val app = recordBlocked(srcIp, dstIp, srcPort, qname, kind)
-                Log.d(TAG, "Заблокировано: $qname (${kind.name})")
-                applyThrottle(app)
-                // NXDOMAIN вместо «тишины»: клиент завершает запрос сразу, без
-                // таймаута и повторов, которые могли бы «проскочить» мимо фильтра.
+                if (hostAllowedByUser) {
+                    Log.d(TAG, "Пользователь разрешил хост: $qname")
+                } else {
+                    val owner = app ?: BlockStats.OTHER
+                    val kind = if (trackersMatch) BlockStats.Kind.TRACKER else BlockStats.Kind.ADS
+                    blockedCount.incrementAndGet()
+                    BlockStats.record(owner, qname, kind)
+                    Log.d(TAG, "Заблокировано: $qname (${kind.name})")
+                    if (trackersMatch) {
+                        applyThrottle(owner)
+                        if (logging) RequestLog.record(owner, qname, RequestLog.Status.TRACKER, srcIpStr, dstIpStr)
+                    } else if (logging) {
+                        RequestLog.record(owner, qname, RequestLog.Status.ADS, srcIpStr, dstIpStr)
+                    }
+                    // NXDOMAIN вместо «тишины»: клиент завершает запрос сразу, без
+                    // таймаута и повторов, которые могли бы «проскочить» мимо фильтра.
+                    buildNxdomainResponse(packet, dnsStart)?.let {
+                        writeDnsResponse(srcIp, dstIp, srcPort, it)
+                    }
+                    return
+                }
+            }
+        }
+
+        // Трекер-троттлинг: пока приложение в «бане», глушим даже разрешённые
+        // запросы — новые соединения не создаются, доступ фактически отключён.
+        if (activeThrottles > 0) {
+            val owner = app ?: attributedApp(srcIp, dstIp, srcPort)
+            if (isThrottled(owner)) {
+                Log.d(TAG, "Троттлинг: доступ отключён \"$owner\" (запрос $qname)")
+                if (logging) RequestLog.record(owner, qname, RequestLog.Status.THROTTLE, srcIpStr, dstIpStr)
                 buildNxdomainResponse(packet, dnsStart)?.let {
                     writeDnsResponse(srcIp, dstIp, srcPort, it)
                 }
@@ -423,17 +486,9 @@ class BlockVpnService : VpnService() {
             }
         }
 
-        // Трекер-троттлинг: пока приложение в «бане», глушим даже разрешённые
-        // запросы — новые соединения не создаются, доступ фактически отключён.
-        if (activeThrottles > 0) {
-            val app = attributedApp(srcIp, dstIp, srcPort)
-            if (isThrottled(app)) {
-                Log.d(TAG, "Троттлинг: доступ отключён \"$app\" (запрос $qname)")
-                buildNxdomainResponse(packet, dnsStart)?.let {
-                    writeDnsResponse(srcIp, dstIp, srcPort, it)
-                }
-                return
-            }
+        if (logging) {
+            val owner = app ?: attributedApp(srcIp, dstIp, srcPort)
+            RequestLog.record(owner, qname, RequestLog.Status.ALLOWED, srcIpStr, dstIpStr)
         }
 
         // копируем полезную нагрузку: буфер перезапишется следующим чтением
@@ -443,38 +498,6 @@ class BlockVpnService : VpnService() {
         relayPool?.execute {
             relayDns(dnsPayload, clientIp, serverIp, srcPort)
         }
-    }
-
-    /**
-     * Факт блокировки в статистику.
-     *
-     * На Android DNS-запросы уходят через системный резолвер netd, поэтому
-     * исходный сокет почти всегда «системный» (uid 0/1000) и по нему приложение
-     * не определить. Цепочка сигналов — по уровню API, на котором каждый
-     * появился, в порядке убывания надёжности:
-     *  1. безусловно: сокет из /proc/net/udp принадлежит реальному приложению —
-     *     берём его (дешёвый случай, ловит приложения со своим DNS-сокетом);
-     *  2. API 29+: [ConnectivityManager.getConnectionOwnerUid] для той же пары
-     *     адресов — владелец сокета в netd; иногда безуспешен (см.
-     *     [probeConnectionOwnerUid]) — тогда молча уступает место ниже;
-     *  3. API 23+: приложение, передавшее данные в последнем опросе NetworkStats
-     *     (прирост за секунду; в пределах ACTIVE_APP_WINDOW_MS);
-     *  4. иначе — «другое».
-     *
-     * Уровень 23+ версионной проверки не требует: minSdk 24 выше и API 23.
-     * Уровень 29+ недоступен на Android 9 и ниже — там работает только эвристика.
-     */
-    private fun recordBlocked(
-        srcIp: ByteArray,
-        dstIp: ByteArray,
-        srcPort: Int,
-        host: String,
-        kind: BlockStats.Kind
-    ): String {
-        val raw = attributedApp(srcIp, dstIp, srcPort)
-        Log.d(TAG, "Атрибуция \"$host\": -> \"$raw\" (activeUid=$lastActiveUid)")
-        BlockStats.record(raw, host, kind)
-        return raw
     }
 
     /**
@@ -511,9 +534,24 @@ class BlockVpnService : VpnService() {
     }
 
     /**
-     * Решает, кто автор DNS-запроса, по цепочке сигналов из [recordBlocked].
-     * Используется и для статистики, и для освобождения собственных приложений
-     * от блокировки.
+     * Решает, кто автор DNS-запроса. Используется для статистики, лога,
+     * per-app настроек, троттлинга и освобождения собственных приложений.
+     *
+     * На Android DNS-запросы уходят через системный резолвер netd, поэтому
+     * исходный сокет почти всегда «системный» (uid 0/1000) и по нему приложение
+     * не определить. Цепочка сигналов — по уровню API, на котором каждый
+     * появился, в порядке убывания надёжности:
+     *  1. безусловно: сокет из /proc/net/udp принадлежит реальному приложению —
+     *     берём его (дешёвый случай, ловит приложения со своим DNS-сокетом);
+     *  2. API 29+: [ConnectivityManager.getConnectionOwnerUid] для той же пары
+     *     адресов — владелец сокета в netd; иногда безуспешен (см.
+     *     [probeConnectionOwnerUid]) — тогда молча уступает место ниже;
+     *  3. API 23+: приложение, передавшее данные в последнем опросе NetworkStats
+     *     (прирост за секунду; в пределах ACTIVE_APP_WINDOW_MS);
+     *  4. иначе — «другое».
+     *
+     * Уровень 23+ версионной проверки не требует: minSdk 24 выше и API 23.
+     * Уровень 29+ недоступен на Android 9 и ниже — там работает только эвристика.
      */
     private fun attributedApp(srcIp: ByteArray, dstIp: ByteArray, srcPort: Int): String {
         val uid = uidForSourcePort(srcPort)

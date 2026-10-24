@@ -44,4 +44,40 @@
     <string name="update_download_error">Не удалось скачать обновление. Проверьте подключение к интернету.</string>
     <string name="update_install_permission_hint">Разрешите установку приложений из этого источника, чтобы обновить AntiTrack.</string>
     <string name="update_install_error">Не удалось открыть установщик обновления.</string>
+
+    <!-- Нижнее меню -->
+    <string name="tab_home">Главная</string>
+    <string name="tab_logs">Логи</string>
+    <string name="tab_settings">Настройки</string>
+
+    <!-- Логи DNS -->
+    <string name="logs_title">Логи</string>
+    <string name="logs_enable">Включить лог</string>
+    <string name="logs_disable">Выключить лог</string>
+    <string name="logs_description">Все DNS-запросы устройства с возможностью посмотреть детали и заблокировать/разрешить конкретный хост.</string>
+    <string name="logs_disabled">Лог выключен. Включите его, чтобы видеть DNS-запросы в реальном времени.</string>
+    <string name="logs_empty">Запросов пока нет. Включите защиту на главном экране, если она ещё не запущена.</string>
+    <string name="logs_count">Запросов: %1$d</string>
+    <string name="logs_clear">Очистить</string>
+    <string name="log_status_allowed">не заблокировано</string>
+    <string name="log_status_tracker">заблокировано: трекер</string>
+    <string name="log_status_ads">заблокировано: реклама</string>
+    <string name="log_status_throttle">заблокировано: троттлинг</string>
+    <string name="log_status_custom_blocked">заблокировано пользователем</string>
+    <string name="logs_details_title">Детали запроса</string>
+    <string name="logs_details_host">Хост</string>
+    <string name="logs_details_app">Приложение</string>
+    <string name="logs_details_time">Время</string>
+    <string name="logs_details_src_ip">IP отправителя</string>
+    <string name="logs_details_dst_ip">IP резолвера</string>
+    <string name="logs_details_status">Статус</string>
+    <string name="logs_details_pattern">Правило блокировки</string>
+    <string name="logs_details_pattern_none">Не заблокирован по встроенному списку</string>
+    <string name="logs_block_host">Блокировать %1$s</string>
+    <string name="logs_allow_host">В следующие раз не блокировать %1$s</string>
+    <string name="logs_close">Закрыть</string>
+    <string name="logs_unknown_ip">Неизвестен</string>
+
+    <!-- Заглушка раздела настроек -->
+    <string name="settings_placeholder">Раздел «Настройки» пока в разработке.</string>
 </resources>
