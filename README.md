@@ -10,7 +10,7 @@ VPN-сервис, который фильтрует DNS-запросы на ус
 
 - Пакет: `ru.tapps.trackerblocker.stable`
 - Минимальная версия Android: 7.0 (API 24)
-- Текущая версия: 1.0
+- Текущая версия: 1.2
 - Tracker list: <https://github.com/garte5484/alltrackerlist>
 - Advert list: <https://github.com/garte5484/alladlist>
 
