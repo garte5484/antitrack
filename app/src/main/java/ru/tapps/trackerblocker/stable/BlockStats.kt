@@ -2,6 +2,8 @@ package ru.tapps.trackerblocker.stable
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.os.Handler
+import android.os.HandlerThread
 import androidx.compose.runtime.mutableStateOf
 import org.json.JSONObject
 
@@ -35,8 +37,21 @@ object BlockStats {
     private const val PREF_NAME = "block_stats"
     private const val KEY_JSON = "data"
 
+    /**
+     * Запись статистики отложена: при активном фоне счётчики меняются на
+     * каждый DNS-запрос, а сериализация всего JSON на каждую блокировку
+     * заметно нагружает поток VPN. Копим изменения и пишем раз в секунду.
+     */
+    private const val PERSIST_DELAY_MS = 1_000L
+
     private val lock = Any()
     private var prefs: SharedPreferences? = null
+
+    private val persistThread = HandlerThread("BlockStats-persist").apply { start() }
+    private val persistHandler = Handler(persistThread.looper)
+    private val persistRunnable = Runnable {
+        synchronized(lock) { persist() }
+    }
 
     // приложение -> домен -> счётчики
     private val data = LinkedHashMap<String, MutableMap<String, HostCounts>>()
@@ -61,17 +76,29 @@ object BlockStats {
                 Kind.TRACKER -> HostCounts(prev.trackers + 1, prev.ads)
                 Kind.ADS -> HostCounts(prev.trackers, prev.ads + 1)
             }
-            persist()
             publish()
         }
+        schedulePersist()
     }
 
     fun clear() {
+        persistHandler.removeCallbacks(persistRunnable)
         synchronized(lock) {
             data.clear()
             prefs?.edit()?.remove(KEY_JSON)?.apply()
             publish()
         }
+    }
+
+    /** Немедленно записывает накопленные счётчики (например, при остановке VPN). */
+    fun flush() {
+        persistHandler.removeCallbacks(persistRunnable)
+        synchronized(lock) { persist() }
+    }
+
+    private fun schedulePersist() {
+        persistHandler.removeCallbacks(persistRunnable)
+        persistHandler.postDelayed(persistRunnable, PERSIST_DELAY_MS)
     }
 
     fun displayName(context: Context, packageName: String): String {

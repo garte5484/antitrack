@@ -5,9 +5,16 @@
     <string name="notification_channel_name">AntiTrack VPN</string>
     <string name="notification_title">AntiTrack активен</string>
     <string name="notification_message">Защита включена, блокировки выполняются</string>
+    <string name="notification_paused_title">AntiTrack на паузе</string>
+    <string name="notification_paused_text">Блокировка приостановлена до %1$s</string>
+    <string name="notification_action_pause">Пауза 15 мин</string>
+    <string name="notification_action_resume">Возобновить</string>
+    <string name="notification_action_stop">Стоп</string>
 
     <string name="status_off">Защита выключена</string>
     <string name="status_on">Защита включена</string>
+    <string name="status_paused">Защита на паузе</string>
+    <string name="status_description_paused">Блокировка приостановлена до %1$s</string>
     <string name="status_on_all">Трекеры и реклама блокируются</string>
     <string name="status_on_trackers">Трекеры блокируются</string>
     <string name="status_on_ads">Реклама блокируется</string>
@@ -59,6 +66,16 @@
     <string name="logs_empty">Запросов пока нет. Включите защиту на главном экране, если она ещё не запущена.</string>
     <string name="logs_count">Запросов: %1$d</string>
     <string name="logs_clear">Очистить</string>
+    <string name="logs_search_hint">Поиск по хосту или приложению</string>
+    <string name="logs_filter_all">Все</string>
+    <string name="logs_filter_blocked">Заблокированные</string>
+    <string name="logs_filter_allowed">Разрешённые</string>
+    <string name="logs_filtered_count">Показано %1$d из %2$d</string>
+    <string name="logs_nothing_found">Ничего не найдено</string>
+    <string name="logs_show_more">Показать полностью</string>
+    <string name="logs_show_less">Свернуть</string>
+    <string name="logs_pattern_throttle">Трекер-троттлинг (временный)</string>
+    <string name="logs_pattern_custom">Пользовательское правило (точный хост: %1$s)</string>
     <string name="log_status_allowed">не заблокировано</string>
     <string name="log_status_tracker">заблокировано: трекер</string>
     <string name="log_status_ads">заблокировано: реклама</string>
@@ -74,15 +91,39 @@
     <string name="logs_details_pattern">Правило блокировки</string>
     <string name="logs_details_pattern_none">Не заблокирован по встроенному списку</string>
     <string name="logs_block_host">Блокировать %1$s</string>
-    <string name="logs_allow_host">В следующие раз не блокировать %1$s</string>
+    <string name="logs_allow_host">В следующий раз не блокировать %1$s</string>
     <string name="logs_close">Закрыть</string>
     <string name="logs_unknown_ip">Неизвестен</string>
 
     <!-- Раздел настроек -->
+    <string name="settings_section_protection">Защита</string>
     <string name="settings_blocklists">Блоклисты</string>
     <string name="settings_update_blocklists">Обновить блоклисты</string>
     <string name="settings_update_blocklists_done">Блоклисты обновлены</string>
     <string name="settings_update_blocklists_no_internet">Нет подключения к интернету</string>
     <string name="settings_update_blocklists_failed">Не удалось обновить блоклисты</string>
-    <string name="settings_placeholder">Раздел «Настройки» пока в разработке.</string>
+    <string name="settings_blocklists_updated">Обновлены: %1$s</string>
+    <string name="settings_blocklists_never">Ещё не обновлялись</string>
+    <string name="settings_block_trackers_for_app">Блокировать трекеры для этого приложения</string>
+    <string name="settings_section_rules">Правила</string>
+    <string name="settings_open_rules">Пользовательские правила</string>
+    <string name="settings_rules_summary">Заблокировано вручную: %1$d · разрешено: %2$d</string>
+    <string name="settings_section_access">Доступ к статистике</string>
+    <string name="settings_usage_access_granted">Доступ выдан — статистика по приложениям точная</string>
+    <string name="settings_usage_access_missing">Разрешите доступ, иначе блокировки могут записываться в «Систему»</string>
+    <string name="settings_section_about">О приложении</string>
+    <string name="settings_version">Версия %1$s</string>
+
+    <!-- Пользовательские правила -->
+    <string name="rules_title">Пользовательские правила</string>
+    <string name="rules_back">Назад</string>
+    <string name="rules_hint">Правила действуют на точный хост. Разрешение отменяет блокировку из встроенных списков.</string>
+    <string name="rules_add_hint">Домен, например example.com</string>
+    <string name="rules_add_block">Заблокировать</string>
+    <string name="rules_add_allow">Разрешить</string>
+    <string name="rules_blocked_section">Заблокированные вручную (%1$d)</string>
+    <string name="rules_allowed_section">Разрешённые (%1$d)</string>
+    <string name="rules_empty_blocked">Нет заблокированных хостов</string>
+    <string name="rules_empty_allowed">Нет разрешённых хостов</string>
+    <string name="rules_remove">Удалить</string>
 </resources>

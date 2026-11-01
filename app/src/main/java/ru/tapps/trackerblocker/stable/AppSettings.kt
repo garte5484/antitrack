@@ -16,6 +16,7 @@ object AppSettings {
     private const val PREF_NAME = "antitrack_settings"
     const val KEY_BLOCK_TRACKERS = "block_trackers"
     const val KEY_BLOCK_ADS = "block_ads"
+    private const val KEY_PAUSE_UNTIL = "pause_until"
 
     private var prefs: SharedPreferences? = null
 
@@ -35,5 +36,19 @@ object AppSettings {
 
     fun setBlockAds(enabled: Boolean) {
         prefs?.edit()?.putBoolean(KEY_BLOCK_ADS, enabled)?.apply()
+    }
+
+    /** До какого момента блокировка приостановлена (0 — пауза не включена). */
+    fun pauseUntil(): Long = prefs?.getLong(KEY_PAUSE_UNTIL, 0L) ?: 0L
+
+    /** Приостановлена ли блокировка прямо сейчас. */
+    fun isPaused(): Boolean = pauseUntil() > System.currentTimeMillis()
+
+    fun pauseFor(durationMs: Long) {
+        prefs?.edit()?.putLong(KEY_PAUSE_UNTIL, System.currentTimeMillis() + durationMs)?.apply()
+    }
+
+    fun clearPause() {
+        prefs?.edit()?.putLong(KEY_PAUSE_UNTIL, 0L)?.apply()
     }
 }

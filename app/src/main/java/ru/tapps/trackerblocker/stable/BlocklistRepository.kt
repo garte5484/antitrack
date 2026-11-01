@@ -123,6 +123,9 @@ object BlocklistRepository {
             synchronized(lock) { ensureLoadedLocked(app) }
         }
 
+        /** Время последнего успешного скачивания списка, мс (0 — ещё не качали). */
+        fun lastUpdated(app: Context): Long = prefs(app).getLong(KEY_TIMESTAMP, 0L)
+
         private fun ensureLoadedLocked(app: Context) {
             if (current.isNotEmpty()) return
             val file = cacheFile(app)
@@ -230,6 +233,12 @@ object BlocklistRepository {
         return if (trackersOk && adsOk) RefreshResult.SUCCESS else RefreshResult.FAILED
     }
 
+    /** Время последнего успешного обновления любого из списков, мс. */
+    fun lastUpdated(context: Context): Long {
+        val app = context.applicationContext
+        return maxOf(trackersSource.lastUpdated(app), adsSource.lastUpdated(app))
+    }
+
     private fun hasInternet(context: Context): Boolean {
         return try {
             val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
@@ -243,7 +252,7 @@ object BlocklistRepository {
     }
 
     /** Разбирает текст списка: домены и ключевые слова (без дублей, в нижнем регистре). */
-    private fun parse(text: String): Set<String> {
+    internal fun parse(text: String): Set<String> {
         val result = HashSet<String>()
         for (rawLine in text.lineSequence()) {
             var line = rawLine.trim()
@@ -268,10 +277,12 @@ object BlocklistRepository {
      * в имени. Разные мусорные записи (URL-пути со слэшем `/watdog/`,
      * подстановки `*`, IPv4, служебные имена, знаки препинания) пропускаем.
      */
-    private fun normalize(token: String): String? {
+    internal fun normalize(token: String): String? {
         var value = token.trim()
         if (value.isEmpty()) return null
         value = value.removeSuffix(".")
+        if (value.contains('/')) return null // это URL-путь, а не имя хоста
+        if ('*' in value) return null
         if (value in ignoreList) return null
         if (isIpv4(value)) return null
 

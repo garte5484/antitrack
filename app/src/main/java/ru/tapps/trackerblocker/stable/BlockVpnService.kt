@@ -9,9 +9,12 @@ import android.app.usage.NetworkStatsManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.graphics.drawable.Icon
 import android.net.ConnectivityManager
 import android.net.VpnService
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.os.Process
 import android.system.ErrnoException
@@ -24,6 +27,8 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
@@ -58,6 +63,10 @@ class BlockVpnService : VpnService() {
     private var tunnelWriter: java.io.FileDescriptor? = null
 
     private val writeLock = Any()
+
+    /** Обновление уведомления после окончания паузы. */
+    private val notifyHandler = Handler(Looper.getMainLooper())
+    private val pauseEndRunnable = Runnable { if (running) showNotification() }
 
     @Volatile
     private var relayPool: java.util.concurrent.ExecutorService? = null
@@ -120,6 +129,9 @@ class BlockVpnService : VpnService() {
         private const val TAG = "BlockVpnService"
         private const val CHANNEL_ID = "antitrack_vpn"
         private const val NOTIFICATION_ID = 1
+        private const val REQUEST_PAUSE = 10
+        private const val REQUEST_RESUME = 11
+        private const val REQUEST_STOP = 12
 
         /** Окно, в течение которого приложение считается «активно передававшим». */
         private const val ACTIVE_APP_WINDOW_MS = 30_000L
@@ -146,6 +158,12 @@ class BlockVpnService : VpnService() {
         )
 
         const val ACTION_STOP = "ru.tapps.trackerblocker.stable.action.STOP"
+        const val ACTION_PAUSE = "ru.tapps.trackerblocker.stable.action.PAUSE"
+        const val ACTION_RESUME = "ru.tapps.trackerblocker.stable.action.RESUME"
+        const val ACTION_REFRESH = "ru.tapps.trackerblocker.stable.action.REFRESH"
+
+        /** Длительность паузы из уведомления. */
+        private const val PAUSE_DURATION_MS = 15 * 60 * 1000L
 
         private const val TUN_IP = "10.88.88.1"
         private const val TUN_PREFIX = 24
@@ -235,14 +253,35 @@ class BlockVpnService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
         Log.i(TAG, "onStartCommand: running=$running startId=$startId action=${intent?.action ?: "null"}")
-        if (intent?.action == ACTION_STOP) {
-            // Платформа держит binding к VpnService, поэтому stopService() не может
-            // уничтожить сервис. Правильное отключение: закрыть fd туннеля — система
-            // разорвёт VPN, отпустит binding и вызовет onDestroy.
-            Log.i(TAG, "Команда отключения")
-            teardown()
-            stopSelf()
-            return START_NOT_STICKY
+        when (intent?.action) {
+            ACTION_STOP -> {
+                // Платформа держит binding к VpnService, поэтому stopService() не может
+                // уничтожить сервис. Правильное отключение: закрыть fd туннеля — система
+                // разорвёт VPN, отпустит binding и вызовет onDestroy.
+                Log.i(TAG, "Команда отключения")
+                AppSettings.clearPause()
+                notifyHandler.removeCallbacks(pauseEndRunnable)
+                teardown()
+                stopSelf()
+                return START_NOT_STICKY
+            }
+            ACTION_PAUSE -> {
+                AppSettings.pauseFor(PAUSE_DURATION_MS)
+                Log.i(TAG, "Пауза блокировки на ${PAUSE_DURATION_MS / 60_000} мин")
+                showNotification()
+                return START_STICKY
+            }
+            ACTION_RESUME -> {
+                AppSettings.clearPause()
+                Log.i(TAG, "Блокировка возобновлена")
+                showNotification()
+                return START_STICKY
+            }
+            ACTION_REFRESH -> {
+                // Настройки блокировки изменились — обновляем текст уведомления.
+                showNotification()
+                return START_STICKY
+            }
         }
         // startForeground до establish(): если create вернёт null, сервис можно
         // остановить без ForegroundServiceDidNotStartInTimeException.
@@ -253,6 +292,8 @@ class BlockVpnService : VpnService() {
 
     override fun onDestroy() {
         Log.i(TAG, "onDestroy")
+        notifyHandler.removeCallbacks(pauseEndRunnable)
+        BlockStats.flush()
         teardown()
         super.onDestroy()
     }
@@ -407,6 +448,28 @@ class BlockVpnService : VpnService() {
         val logging = RequestLog.isEnabled
         val srcIpStr = srcIp.joinToString(".")
         val dstIpStr = dstIp.joinToString(".")
+
+        // Пауза из уведомления: фильтрация временно отключена, запросы идут
+        // напрямую к резолверу, но продолжают попадать в лог как разрешённые.
+        if (AppSettings.isPaused()) {
+            val owner = if (logging) attributedApp(srcIp, dstIp, srcPort) else null
+            if (logging) {
+                RequestLog.record(
+                    owner ?: BlockStats.OTHER,
+                    qname,
+                    RequestLog.Status.ALLOWED,
+                    srcIpStr,
+                    dstIpStr
+                )
+            }
+            val dnsPayload = packet.copyOfRange(dnsStart, len)
+            val clientIp = srcIp
+            val serverIp = dstIp
+            relayPool?.execute {
+                relayDns(dnsPayload, clientIp, serverIp, srcPort)
+            }
+            return
+        }
 
         // Пользовательские правила работают по точному хосту
         if (HostRules.isBlocked(qname)) {
@@ -1019,16 +1082,93 @@ class BlockVpnService : VpnService() {
     }
 
     private fun showNotification() {
-        val notification = Notification.Builder(this, CHANNEL_ID)
-            .setContentTitle(getString(R.string.notification_title))
-            .setContentText(blockingStatusText())
+        val paused = AppSettings.isPaused()
+        val builder = Notification.Builder(this, CHANNEL_ID)
+            .setContentTitle(
+                getString(
+                    if (paused) R.string.notification_paused_title
+                    else R.string.notification_title
+                )
+            )
+            .setContentText(
+                if (paused) getString(R.string.notification_paused_text, pauseEndText())
+                else blockingStatusText()
+            )
             .setSmallIcon(R.drawable.ic_stat_shield)
+            .setContentIntent(
+                PendingIntent.getActivity(
+                    this, 0, Intent(this, MainActivity::class.java),
+                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+                )
+            )
             .setOngoing(true)
-            .build()
+            .setOnlyAlertOnce(true)
+
+        if (paused) {
+            builder.addAction(
+                notificationAction(
+                    R.drawable.ic_notif_resume,
+                    R.string.notification_action_resume,
+                    ACTION_RESUME,
+                    REQUEST_RESUME
+                )
+            )
+        } else {
+            builder.addAction(
+                notificationAction(
+                    R.drawable.ic_notif_pause,
+                    R.string.notification_action_pause,
+                    ACTION_PAUSE,
+                    REQUEST_PAUSE
+                )
+            )
+        }
+        builder.addAction(
+            notificationAction(
+                R.drawable.ic_notif_stop,
+                R.string.notification_action_stop,
+                ACTION_STOP,
+                REQUEST_STOP
+            )
+        )
+
+        val notification = builder.build()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
         } else {
             startForeground(NOTIFICATION_ID, notification)
+        }
+        schedulePauseEndRefresh()
+    }
+
+    private fun notificationAction(
+        iconRes: Int,
+        titleRes: Int,
+        action: String,
+        requestCode: Int
+    ): Notification.Action {
+        val intent = Intent(this, BlockVpnService::class.java).setAction(action)
+        val pending = PendingIntent.getService(
+            this, requestCode, intent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        return Notification.Action.Builder(
+            Icon.createWithResource(this, iconRes),
+            getString(titleRes),
+            pending
+        ).build()
+    }
+
+    /** Время окончания паузы в формате ЧЧ:ММ. */
+    private fun pauseEndText(): String =
+        SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(AppSettings.pauseUntil()))
+
+    /** Через сколько закончится пауза — обновляем уведомление автоматически. */
+    private fun schedulePauseEndRefresh() {
+        notifyHandler.removeCallbacks(pauseEndRunnable)
+        val remaining = AppSettings.pauseUntil() - System.currentTimeMillis()
+        if (remaining > 0) {
+            notifyHandler.postDelayed(pauseEndRunnable, remaining + 500)
         }
     }
 

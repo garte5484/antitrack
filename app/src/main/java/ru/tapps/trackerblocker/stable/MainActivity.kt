@@ -13,11 +13,13 @@ import android.os.Bundle
 import android.os.Process
 import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -32,11 +34,14 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -44,7 +49,9 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedCard
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
@@ -96,6 +103,9 @@ import java.io.File
 
 /** Какая вкладка компаний открыта в диалоге приложения. */
 private enum class CompanyTab { TRACKERS, ADS }
+
+/** Фильтр логов по результату DNS-запроса. */
+private enum class LogFilter { ALL, BLOCKED, ALLOWED }
 
 /** Состояние проверки обновлений на главном экране. */
 sealed interface UpdateState {
@@ -320,15 +330,36 @@ fun AntiTrackScreen(
     var selectedApp by remember { mutableStateOf<String?>(null) }
     var blockTrackers by remember { mutableStateOf(AppSettings.blockTrackers()) }
     var blockAds by remember { mutableStateOf(AppSettings.blockAds()) }
-    var showSettings by remember { mutableStateOf(false) }
     var currentTab by remember { mutableStateOf(AppTab.HOME) }
+    var showRules by remember { mutableStateOf(false) }
+    var paused by remember { mutableStateOf(AppSettings.isPaused()) }
     val context = LocalContext.current
     var usageAccess by remember { mutableStateOf(hasUsageAccess(context)) }
     val stats by BlockStats.state
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
+    // Переключатели влияют на текст уведомления, пока сервис работает.
+    val refreshServiceNotification = {
+        if (BlockVpnService.isRunning) {
+            context.startService(
+                Intent(context, BlockVpnService::class.java)
+                    .setAction(BlockVpnService.ACTION_REFRESH)
+            )
+        }
+    }
+
+    BackHandler(enabled = showRules) { showRules = false }
+
+    val pausedUntilText = remember(paused) {
+        if (paused) {
+            SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(AppSettings.pauseUntil()))
+        } else {
+            ""
+        }
+    }
     val statusText = when {
         !isRunning -> stringResource(R.string.status_off)
+        paused -> stringResource(R.string.status_paused)
         blockTrackers && blockAds -> stringResource(R.string.status_on_all)
         blockTrackers -> stringResource(R.string.status_on_trackers)
         blockAds -> stringResource(R.string.status_on_ads)
@@ -337,6 +368,7 @@ fun AntiTrackScreen(
     val cannotStart = !isRunning && !blockTrackers && !blockAds
     val statusDescription = when {
         !isRunning -> stringResource(R.string.status_description_off)
+        paused -> stringResource(R.string.status_description_paused, pausedUntilText)
         blockTrackers && blockAds -> stringResource(R.string.status_description_all)
         blockTrackers -> stringResource(R.string.status_description_trackers)
         blockAds -> stringResource(R.string.status_description_ads)
@@ -367,6 +399,7 @@ fun AntiTrackScreen(
     LaunchedEffect(Unit) {
         while (true) {
             isRunning = BlockVpnService.isRunning
+            paused = AppSettings.isPaused()
             usageAccess = hasUsageAccess(context)
             delay(500)
         }
@@ -375,28 +408,35 @@ fun AntiTrackScreen(
     Scaffold(
         modifier = Modifier.fillMaxSize(),
         bottomBar = {
-            NavigationBar {
-                AppTab.entries.forEach { tab ->
-                    NavigationBarItem(
-                        selected = currentTab == tab,
-                        onClick = {
-                            currentTab = tab
-                            selectedApp = null
-                            showSettings = false
-                        },
-                        icon = {
-                            Icon(
-                                painter = painterResource(tab.iconRes),
-                                contentDescription = null
-                            )
-                        },
-                        label = { Text(stringResource(tab.labelRes)) }
-                    )
+            if (!showRules) {
+                NavigationBar {
+                    AppTab.entries.forEach { tab ->
+                        NavigationBarItem(
+                            selected = currentTab == tab,
+                            onClick = {
+                                currentTab = tab
+                                selectedApp = null
+                                showRules = false
+                            },
+                            icon = {
+                                Icon(
+                                    painter = painterResource(tab.iconRes),
+                                    contentDescription = null
+                                )
+                            },
+                            label = { Text(stringResource(tab.labelRes)) }
+                        )
+                    }
                 }
             }
         }
     ) { innerPadding ->
-        when (currentTab) {
+        if (showRules) {
+            RulesScreen(
+                modifier = Modifier.padding(innerPadding),
+                onBack = { showRules = false }
+            )
+        } else when (currentTab) {
             AppTab.HOME -> Column(
                 modifier = Modifier
                     .fillMaxSize()
@@ -443,10 +483,22 @@ fun AntiTrackScreen(
                 }
 
                 TextButton(
-                    onClick = { showSettings = true },
+                    onClick = { currentTab = AppTab.SETTINGS },
                     modifier = Modifier.padding(top = 4.dp)
                 ) {
                     Text(stringResource(R.string.settings_button))
+                }
+
+                if (isRunning && paused) {
+                    TextButton(onClick = {
+                        context.startService(
+                            Intent(context, BlockVpnService::class.java)
+                                .setAction(BlockVpnService.ACTION_RESUME)
+                        )
+                        paused = false
+                    }) {
+                        Text(stringResource(R.string.notification_action_resume))
+                    }
                 }
 
                 if (cannotStart) {
@@ -537,7 +589,23 @@ fun AntiTrackScreen(
             }
         }
             AppTab.LOGS -> LogsScreen(Modifier.padding(innerPadding))
-            AppTab.SETTINGS -> SettingsPlaceholder(Modifier.padding(innerPadding))
+            AppTab.SETTINGS -> SettingsScreen(
+                modifier = Modifier.padding(innerPadding),
+                blockTrackers = blockTrackers,
+                blockAds = blockAds,
+                usageAccess = usageAccess,
+                onBlockTrackersChange = {
+                    blockTrackers = it
+                    AppSettings.setBlockTrackers(it)
+                    refreshServiceNotification()
+                },
+                onBlockAdsChange = {
+                    blockAds = it
+                    AppSettings.setBlockAds(it)
+                    refreshServiceNotification()
+                },
+                onOpenRules = { showRules = true }
+            )
         }
     }
 
@@ -602,7 +670,7 @@ fun AntiTrackScreen(
                 Spacer(Modifier.height(12.dp))
                 if (dialogApp != BlockStats.SYSTEM && dialogApp != BlockStats.OTHER && !dialogApp.startsWith("uid:")) {
                     SettingsSwitch(
-                        text = "Блокировать трекеры для этого приложения",
+                        text = stringResource(R.string.settings_block_trackers_for_app),
                         checked = blockTrackersForApp,
                         onCheckedChange = { value ->
                             blockTrackersForApp = value
@@ -679,48 +747,6 @@ fun AntiTrackScreen(
         }
     }
 
-    if (showSettings) {
-        AlertDialog(
-            onDismissRequest = { showSettings = false },
-            title = { Text(stringResource(R.string.settings_title)) },
-            text = {
-                Column {
-                    SettingsSwitch(
-                        text = stringResource(R.string.settings_block_trackers),
-                        checked = blockTrackers,
-                        onCheckedChange = { value ->
-                            blockTrackers = value
-                            AppSettings.setBlockTrackers(value)
-                        }
-                    )
-                    SettingsSwitch(
-                        text = stringResource(R.string.settings_block_ads),
-                        checked = blockAds,
-                        onCheckedChange = { value ->
-                            blockAds = value
-                            AppSettings.setBlockAds(value)
-                        }
-                    )
-                    Spacer(Modifier.height(8.dp))
-                    Text(
-                        text = stringResource(
-                            R.string.settings_list_size,
-                            BlocklistRepository.trackerCount,
-                            BlocklistRepository.adCount
-                        ),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                }
-            },
-            confirmButton = {
-                TextButton(onClick = { showSettings = false }) {
-                    Text(stringResource(R.string.dialog_close))
-                }
-            }
-        )
-    }
-
     when (val update = updateState) {
         UpdateState.None -> Unit
         is UpdateState.Available -> {
@@ -759,7 +785,7 @@ fun AntiTrackScreen(
                             }
                             if (!notesExpanded && lines.size > 8) {
                                 TextButton(onClick = { notesExpanded = true }) {
-                                    Text("Показать полностью")
+                                    Text(stringResource(R.string.logs_show_more))
                                 }
                             }
                         }
@@ -825,6 +851,24 @@ private fun LogsScreen(modifier: Modifier = Modifier) {
         packageNames.associateWith { BlockStats.displayName(context, it) }
     }
     var selectedEntry by remember { mutableStateOf<RequestLog.Entry?>(null) }
+    var query by remember { mutableStateOf("") }
+    var filter by remember { mutableStateOf(LogFilter.ALL) }
+
+    val filteredEntries = remember(entries, query, filter, appNames) {
+        val needle = query.trim().lowercase()
+        entries.filter { entry ->
+            val statusMatches = when (filter) {
+                LogFilter.ALL -> true
+                LogFilter.BLOCKED -> entry.status != RequestLog.Status.ALLOWED
+                LogFilter.ALLOWED -> entry.status == RequestLog.Status.ALLOWED
+            }
+            if (!statusMatches) return@filter false
+            if (needle.isEmpty()) return@filter true
+            entry.host.lowercase().contains(needle) ||
+                (appNames[entry.packageName] ?: entry.packageName).lowercase().contains(needle)
+        }
+    }
+    val isFiltering = query.isNotBlank() || filter != LogFilter.ALL
 
     Column(
         modifier = modifier
@@ -869,12 +913,50 @@ private fun LogsScreen(modifier: Modifier = Modifier) {
                 textAlign = TextAlign.Center
             )
         } else {
+            OutlinedTextField(
+                value = query,
+                onValueChange = { query = it },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                placeholder = { Text(stringResource(R.string.logs_search_hint)) }
+            )
+            Spacer(Modifier.height(8.dp))
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                LogFilter.entries.forEach { value ->
+                    FilterChip(
+                        selected = filter == value,
+                        onClick = { filter = value },
+                        label = {
+                            Text(
+                                stringResource(
+                                    when (value) {
+                                        LogFilter.ALL -> R.string.logs_filter_all
+                                        LogFilter.BLOCKED -> R.string.logs_filter_blocked
+                                        LogFilter.ALLOWED -> R.string.logs_filter_allowed
+                                    }
+                                )
+                            )
+                        }
+                    )
+                }
+            }
+            Spacer(Modifier.height(4.dp))
+
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = stringResource(R.string.logs_count, entries.size),
+                    text = if (isFiltering) {
+                        stringResource(R.string.logs_filtered_count, filteredEntries.size, entries.size)
+                    } else {
+                        stringResource(R.string.logs_count, entries.size)
+                    },
                     style = MaterialTheme.typography.labelLarge,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.weight(1f)
@@ -886,8 +968,8 @@ private fun LogsScreen(modifier: Modifier = Modifier) {
                 }
             }
 
-            if (entries.isEmpty()) {
-                Text(
+            when {
+                entries.isEmpty() -> Text(
                     text = stringResource(R.string.logs_empty),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -896,9 +978,17 @@ private fun LogsScreen(modifier: Modifier = Modifier) {
                         .padding(24.dp),
                     textAlign = TextAlign.Center
                 )
-            } else {
-                LazyColumn(modifier = Modifier.fillMaxSize()) {
-                    items(entries, key = { it.id }) { entry ->
+                filteredEntries.isEmpty() -> Text(
+                    text = stringResource(R.string.logs_nothing_found),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(24.dp),
+                    textAlign = TextAlign.Center
+                )
+                else -> LazyColumn(modifier = Modifier.fillMaxSize()) {
+                    items(filteredEntries, key = { it.id }) { entry ->
                         LogRow(
                             entry = entry,
                             appName = appNames[entry.packageName] ?: entry.packageName,
@@ -933,8 +1023,8 @@ private fun LogsScreen(modifier: Modifier = Modifier) {
                 val p = entry.matchPattern
                 if (p.isNullOrBlank()) "AdBlocklist" else "AdBlocklist: $p"
             }
-            RequestLog.Status.THROTTLE -> "Трекер-троттлинг (временный)"
-            RequestLog.Status.CUSTOM_BLOCKED -> "Пользовательское правило (точный хост: ${entry.host})"
+            RequestLog.Status.THROTTLE -> stringResource(R.string.logs_pattern_throttle)
+            RequestLog.Status.CUSTOM_BLOCKED -> stringResource(R.string.logs_pattern_custom, entry.host)
         }
         var showFullHost by remember(entry.id) { mutableStateOf(false) }
         AlertDialog(
@@ -951,7 +1041,12 @@ private fun LogsScreen(modifier: Modifier = Modifier) {
                             overflow = if (showFullHost) TextOverflow.Visible else TextOverflow.Ellipsis
                         )
                         TextButton(onClick = { showFullHost = !showFullHost }) {
-                            Text(if (showFullHost) "Свернуть" else "Показать полностью")
+                            Text(
+                                stringResource(
+                                    if (showFullHost) R.string.logs_show_less
+                                    else R.string.logs_show_more
+                                )
+                            )
                         }
                     }
                     DetailRow(stringResource(R.string.logs_details_app), appName)
@@ -1059,26 +1154,68 @@ private fun LogRow(
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun SettingsPlaceholder(modifier: Modifier = Modifier) {
+private fun SettingsScreen(
+    modifier: Modifier = Modifier,
+    blockTrackers: Boolean,
+    blockAds: Boolean,
+    usageAccess: Boolean,
+    onBlockTrackersChange: (Boolean) -> Unit,
+    onBlockAdsChange: (Boolean) -> Unit,
+    onOpenRules: () -> Unit
+) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var updating by remember { mutableStateOf(false) }
     var message by remember { mutableStateOf<String?>(null) }
+    var lastUpdated by remember { mutableStateOf(BlocklistRepository.lastUpdated(context)) }
+    val updatedAt = remember(lastUpdated) {
+        if (lastUpdated == 0L) null
+        else SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault()).format(Date(lastUpdated))
+    }
 
     Column(
         modifier = modifier
             .fillMaxSize()
-            .padding(24.dp)
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 24.dp, vertical = 16.dp)
     ) {
         Text(
             text = stringResource(R.string.tab_settings),
             style = MaterialTheme.typography.headlineSmall
         )
-        Spacer(Modifier.height(16.dp))
+
+        Spacer(Modifier.height(20.dp))
+        SectionTitle(stringResource(R.string.settings_section_protection))
+        SettingsSwitch(
+            text = stringResource(R.string.settings_block_trackers),
+            checked = blockTrackers,
+            onCheckedChange = onBlockTrackersChange
+        )
+        SettingsSwitch(
+            text = stringResource(R.string.settings_block_ads),
+            checked = blockAds,
+            onCheckedChange = onBlockAdsChange
+        )
+
+        Spacer(Modifier.height(20.dp))
+        SectionTitle(stringResource(R.string.settings_blocklists))
         Text(
-            text = stringResource(R.string.settings_blocklists),
-            style = MaterialTheme.typography.titleMedium
+            text = stringResource(
+                R.string.settings_list_size,
+                BlocklistRepository.trackerCount,
+                BlocklistRepository.adCount
+            ),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Spacer(Modifier.height(2.dp))
+        Text(
+            text = updatedAt?.let { stringResource(R.string.settings_blocklists_updated, it) }
+                ?: stringResource(R.string.settings_blocklists_never),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
         )
         Spacer(Modifier.height(8.dp))
         Button(
@@ -1090,6 +1227,7 @@ private fun SettingsPlaceholder(modifier: Modifier = Modifier) {
                         BlocklistRepository.forceRefresh(context)
                     }
                     updating = false
+                    lastUpdated = BlocklistRepository.lastUpdated(context)
                     message = context.getString(
                         when (result) {
                             BlocklistRepository.RefreshResult.SUCCESS ->
@@ -1112,14 +1250,213 @@ private fun SettingsPlaceholder(modifier: Modifier = Modifier) {
         }
         message?.let {
             Spacer(Modifier.height(8.dp))
-            Text(it, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text(
+                text = it,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
         }
-        Spacer(Modifier.height(24.dp))
+
+        Spacer(Modifier.height(20.dp))
+        SectionTitle(stringResource(R.string.settings_section_rules))
         Text(
-            text = stringResource(R.string.settings_placeholder),
-            style = MaterialTheme.typography.bodyMedium,
+            text = stringResource(
+                R.string.settings_rules_summary,
+                HostRules.blockedHosts().size,
+                HostRules.allowedHosts().size
+            ),
+            style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
+        Spacer(Modifier.height(8.dp))
+        OutlinedButton(onClick = onOpenRules) {
+            Text(stringResource(R.string.settings_open_rules))
+        }
+
+        Spacer(Modifier.height(20.dp))
+        SectionTitle(stringResource(R.string.settings_section_access))
+        Surface(
+            onClick = { context.startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)) },
+            modifier = Modifier.fillMaxWidth(),
+            shape = MaterialTheme.shapes.medium,
+            color = MaterialTheme.colorScheme.surfaceVariant
+        ) {
+            Text(
+                text = stringResource(
+                    if (usageAccess) R.string.settings_usage_access_granted
+                    else R.string.settings_usage_access_missing
+                ),
+                style = MaterialTheme.typography.bodySmall,
+                color = if (usageAccess) MaterialTheme.colorScheme.onSurfaceVariant
+                else MaterialTheme.colorScheme.primary,
+                modifier = Modifier.padding(12.dp)
+            )
+        }
+
+        Spacer(Modifier.height(20.dp))
+        SectionTitle(stringResource(R.string.settings_section_about))
+        Text(
+            text = stringResource(R.string.settings_version, BuildConfig.VERSION_NAME),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Spacer(Modifier.height(24.dp))
+    }
+}
+
+@Composable
+private fun SectionTitle(text: String) {
+    Text(
+        text = text,
+        style = MaterialTheme.typography.titleMedium,
+        modifier = Modifier.padding(bottom = 8.dp)
+    )
+}
+
+@Composable
+private fun RulesScreen(
+    modifier: Modifier = Modifier,
+    onBack: () -> Unit
+) {
+    var blocked by remember { mutableStateOf(HostRules.blockedHosts()) }
+    var allowed by remember { mutableStateOf(HostRules.allowedHosts()) }
+    var input by remember { mutableStateOf("") }
+    val normalized = input.trim().lowercase().trimEnd('.')
+
+    fun reload() {
+        blocked = HostRules.blockedHosts()
+        allowed = HostRules.allowedHosts()
+    }
+
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .padding(horizontal = 24.dp, vertical = 16.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = stringResource(R.string.rules_title),
+                style = MaterialTheme.typography.headlineSmall,
+                modifier = Modifier.weight(1f)
+            )
+            TextButton(onClick = onBack) {
+                Text(stringResource(R.string.rules_back))
+            }
+        }
+        Text(
+            text = stringResource(R.string.rules_hint),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+
+        Spacer(Modifier.height(12.dp))
+        OutlinedTextField(
+            value = input,
+            onValueChange = { input = it },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            label = { Text(stringResource(R.string.rules_add_hint)) }
+        )
+        Spacer(Modifier.height(8.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Button(
+                onClick = {
+                    HostRules.forceBlock(normalized)
+                    input = ""
+                    reload()
+                },
+                enabled = normalized.isNotEmpty(),
+                modifier = Modifier.weight(1f)
+            ) {
+                Text(stringResource(R.string.rules_add_block))
+            }
+            OutlinedButton(
+                onClick = {
+                    HostRules.forceAllow(normalized)
+                    input = ""
+                    reload()
+                },
+                enabled = normalized.isNotEmpty(),
+                modifier = Modifier.weight(1f)
+            ) {
+                Text(stringResource(R.string.rules_add_allow))
+            }
+        }
+
+        Spacer(Modifier.height(16.dp))
+        LazyColumn(modifier = Modifier.weight(1f)) {
+            item {
+                RuleSectionTitle(stringResource(R.string.rules_blocked_section, blocked.size))
+            }
+            if (blocked.isEmpty()) {
+                item { RuleEmpty(stringResource(R.string.rules_empty_blocked)) }
+            } else {
+                items(blocked.sorted()) { host ->
+                    RuleRow(host) {
+                        HostRules.removeBlocked(host)
+                        reload()
+                    }
+                }
+            }
+            item { Spacer(Modifier.height(16.dp)) }
+            item {
+                RuleSectionTitle(stringResource(R.string.rules_allowed_section, allowed.size))
+            }
+            if (allowed.isEmpty()) {
+                item { RuleEmpty(stringResource(R.string.rules_empty_allowed)) }
+            } else {
+                items(allowed.sorted()) { host ->
+                    RuleRow(host) {
+                        HostRules.removeAllowed(host)
+                        reload()
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun RuleSectionTitle(text: String) {
+    Text(
+        text = text,
+        style = MaterialTheme.typography.titleSmall,
+        modifier = Modifier.padding(vertical = 6.dp)
+    )
+}
+
+@Composable
+private fun RuleEmpty(text: String) {
+    Text(
+        text = text,
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.padding(vertical = 4.dp)
+    )
+}
+
+@Composable
+private fun RuleRow(host: String, onRemove: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = host,
+            style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier.weight(1f)
+        )
+        TextButton(onClick = onRemove) {
+            Text(stringResource(R.string.rules_remove))
+        }
     }
 }
 

@@ -81,4 +81,28 @@ object HostRules {
             saveSet(KEY_BLOCKED, blocked)
         }
     }
+
+    fun blockedHosts(): Set<String> = blocked
+
+    fun allowedHosts(): Set<String> = allowed
+
+    /** Убирает правило ручной блокировки. */
+    fun removeBlocked(host: String) {
+        val h = normalize(host)
+        if (h.isEmpty()) return
+        synchronized(lock) {
+            blocked = blocked - h
+            saveSet(KEY_BLOCKED, blocked)
+        }
+    }
+
+    /** Убирает правило ручного разрешения — хост снова фильтруется списками. */
+    fun removeAllowed(host: String) {
+        val h = normalize(host)
+        if (h.isEmpty()) return
+        synchronized(lock) {
+            allowed = allowed - h
+            saveSet(KEY_ALLOWED, allowed)
+        }
+    }
 }
