@@ -22,20 +22,20 @@ internal object BrandNames {
         Brand(Color(0xFFFC3F1D), "Я", "Яндекс", R.drawable.ic_brand_yandex) {
             it.contains("yandex") || it.contains("yastatic") ||
                 it.contains("yardianalytics") || it.contains("yadro") ||
-                it.contains("ya.ru") || it.equals("yandex")
+                it.contains("ya.ru") || it.equals("yandex") ||
+                it.contains("network-lc") || it.contains("yango")
+        },
+        Brand(Color(0xFF4285F4), "G", "DoubleClick (Google)", R.drawable.ic_brand_google) {
+            it.contains("doubleclick")
         },
         Brand(Color(0xFF4285F4), "G", "Google", R.drawable.ic_brand_google) {
             it.contains("google") || it.contains("gstatic") ||
                 it.contains("app-measurement") || it.contains("crashlytics") ||
                 it.contains("firebase") || it.equals("googl")
         },
-        Brand(Color(0xFF4285F4), "G", "DoubleClick (Google)", R.drawable.ic_brand_google) {
-            it.contains("doubleclick")
-        },
         Brand(Color(0xFF005FF9), "@", "Mail.ru", R.drawable.ic_brand_mail_ru) {
             it.contains("mail.ru") || it.equals("mail")
-        },
-        Brand(Color(0xFF0077FF), "В", "ВКонтакте", R.drawable.ic_brand_vk) {
+        },        Brand(Color(0xFF0077FF), "В", "ВКонтакте", R.drawable.ic_brand_vk) {
             it.contains("vk") || it.contains("userapi")
         },
         Brand(Color(0xFFFF6900), "mi", "Xiaomi", R.drawable.ic_brand_xiaomi) {
@@ -67,23 +67,15 @@ internal object BrandNames {
             it.contains("kochava")
         },
 
-        // — push и краш-репорты —
-        Brand(Color(0xFF455A64), "O", "OneSignal", null) {
-            it.contains("onesignal")
-        },
-        Brand(Color(0xFF7569C9), "S", "Sentry", null) {
-            it.contains("sentry")
-        },
-        Brand(Color(0xFFE0245E), "B", "Bugsnag", null) {
-            it.contains("bugsnag")
-        },
-
         // — продуктовая аналитика —
         Brand(Color(0xFF2D6BFF), "A", "Amplitude", null) {
             it.contains("amplitude")
         },
         Brand(Color(0xFF7856FF), "M", "Mixpanel", null) {
             it.contains("mixpanel")
+        },
+        Brand(Color(0xFF005FF9), "R", "RuStore", R.drawable.ic_brand_rustore) {
+            it.contains("rustore")
         },
         Brand(Color(0xFF3FA796), "S", "Segment", R.drawable.ic_brand_segment) {
             it.contains("segment")

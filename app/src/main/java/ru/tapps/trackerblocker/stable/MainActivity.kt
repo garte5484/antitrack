@@ -39,7 +39,9 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedCard
@@ -50,6 +52,7 @@ import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -303,6 +306,7 @@ private enum class AppTab(val labelRes: Int, val iconRes: Int) {
     SETTINGS(R.string.tab_settings, R.drawable.ic_tab_settings)
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun AntiTrackScreen(
     onToggleVpn: () -> Unit,
@@ -320,6 +324,7 @@ fun AntiTrackScreen(
     val context = LocalContext.current
     var usageAccess by remember { mutableStateOf(hasUsageAccess(context)) }
     val stats by BlockStats.state
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
     val statusText = when {
         !isRunning -> stringResource(R.string.status_off)
@@ -579,83 +584,98 @@ fun AntiTrackScreen(
             CompanyTab.ADS -> adsRows
         }
         var blockTrackersForApp by remember(dialogApp) { mutableStateOf(PerAppSettings.isTrackerBlockingEnabled(dialogApp)) }
-        AlertDialog(
+        ModalBottomSheet(
             onDismissRequest = { selectedApp = null },
-            title = { Text(BlockStats.displayName(context, dialogApp)) },
-            text = {
-                Column {
-                    if (dialogApp != BlockStats.SYSTEM && dialogApp != BlockStats.OTHER && !dialogApp.startsWith("uid:")) {
-                        SettingsSwitch(
-                            text = "Блокировать трекеры для этого приложения",
-                            checked = blockTrackersForApp,
-                            onCheckedChange = { value ->
-                                blockTrackersForApp = value
-                                PerAppSettings.setTrackerBlockingEnabled(dialogApp, value)
-                            }
-                        )
-                        Spacer(Modifier.height(4.dp))
-                    }
-                    if (tabs.size > 1) {
-                        TabRow(selectedTabIndex = tabs.indexOf(currentTab).coerceAtLeast(0)) {
-                            tabs.forEachIndexed { index, tab ->
-                                Tab(
-                                    selected = tab == currentTab,
-                                    onClick = { tabIndex = index },
-                                    text = {
-                                        Text(
-                                            text = stringResource(
-                                                if (tab == CompanyTab.TRACKERS) R.string.tabs_trackers
-                                                else R.string.tabs_ads
-                                            )
+            sheetState = sheetState
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 24.dp)
+                    .padding(bottom = 32.dp)
+            ) {
+                Text(
+                    text = BlockStats.displayName(context, dialogApp),
+                    style = MaterialTheme.typography.headlineSmall
+                )
+                Spacer(Modifier.height(12.dp))
+                if (dialogApp != BlockStats.SYSTEM && dialogApp != BlockStats.OTHER && !dialogApp.startsWith("uid:")) {
+                    SettingsSwitch(
+                        text = "Блокировать трекеры для этого приложения",
+                        checked = blockTrackersForApp,
+                        onCheckedChange = { value ->
+                            blockTrackersForApp = value
+                            PerAppSettings.setTrackerBlockingEnabled(dialogApp, value)
+                        }
+                    )
+                    Spacer(Modifier.height(4.dp))
+                }
+                if (tabs.size > 1) {
+                    TabRow(selectedTabIndex = tabs.indexOf(currentTab).coerceAtLeast(0)) {
+                        tabs.forEachIndexed { index, tab ->
+                            Tab(
+                                selected = tab == currentTab,
+                                onClick = { tabIndex = index },
+                                text = {
+                                    Text(
+                                        text = stringResource(
+                                            if (tab == CompanyTab.TRACKERS) R.string.tabs_trackers
+                                            else R.string.tabs_ads
                                         )
-                                    }
+                                    )
+                                }
+                            )
+                        }
+                    }
+                }
+                if (rows.isEmpty()) {
+                    Text(
+                        text = stringResource(R.string.stats_empty),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(24.dp),
+                        textAlign = TextAlign.Center
+                    )
+                } else {
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 420.dp)
+                    ) {
+                        items(rows, key = { it.first }) { (name, count, host) ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 5.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                LabelAvatar(domain = host, size = 32.dp)
+                                Spacer(Modifier.width(12.dp))
+                                Text(
+                                    text = name,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                Spacer(Modifier.width(8.dp))
+                                Text(
+                                    count.toString(),
+                                    style = MaterialTheme.typography.bodyMedium
                                 )
                             }
                         }
                     }
-                    if (rows.isEmpty()) {
-                        Text(
-                            text = stringResource(R.string.stats_empty),
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(24.dp),
-                            textAlign = TextAlign.Center
-                        )
-                    } else {
-                        LazyColumn(modifier = Modifier.fillMaxWidth().heightIn(max = 320.dp)) {
-                            items(rows, key = { it.first }) { (name, count, host) ->
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(vertical = 5.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    LabelAvatar(domain = host, size = 32.dp)
-                                    Spacer(Modifier.width(12.dp))
-                                    Text(
-                                        text = name,
-                                        style = MaterialTheme.typography.bodyMedium,
-                                        modifier = Modifier.weight(1f)
-                                    )
-                                    Spacer(Modifier.width(8.dp))
-                                    Text(
-                                        count.toString(),
-                                        style = MaterialTheme.typography.bodyMedium
-                                    )
-                                }
-                            }
-                        }
-                    }
                 }
-            },
-            confirmButton = {
-                TextButton(onClick = { selectedApp = null }) {
+                Spacer(Modifier.height(12.dp))
+                Button(
+                    onClick = { selectedApp = null },
+                    modifier = Modifier.align(Alignment.End)
+                ) {
                     Text(stringResource(R.string.dialog_close))
                 }
             }
-        )
+        }
     }
 
     if (showSettings) {
@@ -702,42 +722,60 @@ fun AntiTrackScreen(
 
     when (val update = updateState) {
         UpdateState.None -> Unit
-        is UpdateState.Available -> AlertDialog(
-            onDismissRequest = onDismissUpdate,
-            title = { Text(stringResource(R.string.update_available_title)) },
-            text = {
-                Column {
-                    Text(
-                        stringResource(
-                            R.string.update_available_message,
-                            update.info.version,
-                            BuildConfig.VERSION_NAME
-                        )
-                    )
-                    val notes = update.info.notes
-                    if (!notes.isNullOrBlank()) {
-                        Spacer(Modifier.height(8.dp))
+        is UpdateState.Available -> {
+            var notesExpanded by remember(update.info.version) { mutableStateOf(false) }
+            val rawNotes = update.info.notes
+            val cleanedNotes = rawNotes?.replace("#", "")?.replace("*", "")?.replace("_", " ")?.trim()
+            AlertDialog(
+                onDismissRequest = onDismissUpdate,
+                title = { Text(stringResource(R.string.update_available_title)) },
+                text = {
+                    Column {
                         Text(
-                            text = notes,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 6,
-                            overflow = TextOverflow.Ellipsis
+                            stringResource(
+                                R.string.update_available_message,
+                                update.info.version,
+                                BuildConfig.VERSION_NAME
+                            )
                         )
+                        if (!cleanedNotes.isNullOrBlank()) {
+                            Spacer(Modifier.height(8.dp))
+                            val lines = cleanedNotes.lines().filter { it.isNotBlank() }
+                            if (notesExpanded || lines.size <= 8) {
+                                Text(
+                                    text = cleanedNotes,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            } else {
+                                Text(
+                                    text = lines.take(8).joinToString("\n"),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 8,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            if (!notesExpanded && lines.size > 8) {
+                                TextButton(onClick = { notesExpanded = true }) {
+                                    Text("Показать полностью")
+                                }
+                            }
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = { onDownloadUpdate(update.info) }) {
+                        Text(stringResource(R.string.update_download))
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = onDismissUpdate) {
+                        Text(stringResource(R.string.update_cancel))
                     }
                 }
-            },
-            confirmButton = {
-                TextButton(onClick = { onDownloadUpdate(update.info) }) {
-                    Text(stringResource(R.string.update_download))
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = onDismissUpdate) {
-                    Text(stringResource(R.string.update_cancel))
-                }
-            }
-        )
+            )
+        }
         is UpdateState.Downloading -> AlertDialog(
             // Загрузку можно прервать только кнопкой «Отмена».
             onDismissRequest = {},
@@ -886,17 +924,35 @@ private fun LogsScreen(modifier: Modifier = Modifier) {
         )
         val patternText = when (entry.status) {
             RequestLog.Status.ALLOWED -> stringResource(R.string.logs_details_pattern_none)
-            RequestLog.Status.TRACKER -> "TrackerBlocklist (домен/поддомены/ключевое слово)"
-            RequestLog.Status.ADS -> "AdBlocklist (домен/поддомены/ключевое слово)"
+            RequestLog.Status.TRACKER -> {
+                val p = entry.matchPattern
+                if (p.isNullOrBlank()) "TrackerBlocklist" else "TrackerBlocklist: $p"
+            }
+            RequestLog.Status.ADS -> {
+                val p = entry.matchPattern
+                if (p.isNullOrBlank()) "AdBlocklist" else "AdBlocklist: $p"
+            }
             RequestLog.Status.THROTTLE -> "Трекер-троттлинг (временный)"
-            RequestLog.Status.CUSTOM_BLOCKED -> "Пользовательское правило (точный хост)"
+            RequestLog.Status.CUSTOM_BLOCKED -> "Пользовательское правило (точный хост: ${entry.host})"
         }
+        var showFullHost by remember(entry.id) { mutableStateOf(false) }
         AlertDialog(
             onDismissRequest = { selectedEntry = null },
             title = { Text(stringResource(R.string.logs_details_title)) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    DetailRow(stringResource(R.string.logs_details_host), entry.host)
+                    Column {
+                        Text(stringResource(R.string.logs_details_host), style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text(
+                            text = entry.host,
+                            style = MaterialTheme.typography.bodyMedium,
+                            maxLines = if (showFullHost) Int.MAX_VALUE else 1,
+                            overflow = if (showFullHost) TextOverflow.Visible else TextOverflow.Ellipsis
+                        )
+                        TextButton(onClick = { showFullHost = !showFullHost }) {
+                            Text(if (showFullHost) "Свернуть" else "Показать полностью")
+                        }
+                    }
                     DetailRow(stringResource(R.string.logs_details_app), appName)
                     DetailRow(stringResource(R.string.logs_details_time), dateFormat.format(Date(entry.timeMs)))
                     DetailRow(
@@ -1004,23 +1060,62 @@ private fun LogRow(
 
 @Composable
 private fun SettingsPlaceholder(modifier: Modifier = Modifier) {
+    val context = LocalContext.current
+    var updating by remember { mutableStateOf(false) }
+    var message by remember { mutableStateOf<String?>(null) }
+
     Column(
         modifier = modifier
             .fillMaxSize()
-            .padding(24.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center
+            .padding(24.dp)
     ) {
         Text(
             text = stringResource(R.string.tab_settings),
             style = MaterialTheme.typography.headlineSmall
         )
+        Spacer(Modifier.height(16.dp))
+        Text(
+            text = stringResource(R.string.settings_blocklists),
+            style = MaterialTheme.typography.titleMedium
+        )
         Spacer(Modifier.height(8.dp))
+        Button(
+            onClick = {
+                updating = true
+                message = null
+                Thread {
+                    BlocklistRepository.forceRefresh(context)
+                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                        updating = false
+                        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
+                        val network = cm?.activeNetwork
+                        val caps = network?.let { cm.getNetworkCapabilities(it) }
+                        val hasNet = caps?.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
+                        message = if (hasNet) {
+                            context.getString(R.string.settings_update_blocklists_done)
+                        } else {
+                            context.getString(R.string.settings_update_blocklists_no_internet)
+                        }
+                    }, 2500)
+                }.start()
+            },
+            enabled = !updating
+        ) {
+            Text(stringResource(R.string.settings_update_blocklists))
+        }
+        if (updating) {
+            Spacer(Modifier.height(8.dp))
+            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+        }
+        message?.let {
+            Spacer(Modifier.height(8.dp))
+            Text(it, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        Spacer(Modifier.height(24.dp))
         Text(
             text = stringResource(R.string.settings_placeholder),
             style = MaterialTheme.typography.bodyMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            textAlign = TextAlign.Center
+            color = MaterialTheme.colorScheme.onSurfaceVariant
         )
     }
 }

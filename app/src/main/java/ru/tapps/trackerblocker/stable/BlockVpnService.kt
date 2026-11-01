@@ -410,10 +410,7 @@ class BlockVpnService : VpnService() {
 
         // Пользовательские правила работают по точному хосту
         if (HostRules.isBlocked(qname)) {
-            val appRule = if (AppSettings.blockTrackers() && TrackerBlocklist.isBlocked(qname) ||
-                AppSettings.blockAds() && AdBlocklist.isBlocked(qname) ||
-                logging || activeThrottles > 0
-            ) {
+            val appRule = if (logging || activeThrottles > 0) {
                 attributedApp(srcIp, dstIp, srcPort)
             } else {
                 null
@@ -422,29 +419,29 @@ class BlockVpnService : VpnService() {
             blockedCount.incrementAndGet()
             BlockStats.record(owner, qname, BlockStats.Kind.TRACKER)
             Log.d(TAG, "Заблокировано пользователем: $qname")
-            if (logging) RequestLog.record(owner, qname, RequestLog.Status.CUSTOM_BLOCKED, srcIpStr, dstIpStr)
+            if (logging) RequestLog.record(owner, qname, RequestLog.Status.CUSTOM_BLOCKED, srcIpStr, dstIpStr, qname)
             buildNxdomainResponse(packet, dnsStart)?.let {
                 writeDnsResponse(srcIp, dstIp, srcPort, it)
             }
             return
         }
 
-        val trackerCandidate = AppSettings.blockTrackers() && TrackerBlocklist.isBlocked(qname)
-        val adsCandidate = AppSettings.blockAds() && AdBlocklist.isBlocked(qname)
+        val trackerMatch = if (AppSettings.blockTrackers()) TrackerBlocklist.findMatch(qname) else null
+        val adsMatch = if (AppSettings.blockAds()) AdBlocklist.findMatch(qname) else null
         val hostAllowedByUser = HostRules.isAllowed(qname)
 
         // Автор запроса нужен для лога, per-app настроек и трекер-троттлинга.
-        val app = if (trackerCandidate || adsCandidate || logging || activeThrottles > 0) {
+        val app = if (trackerMatch != null || adsMatch != null || logging || activeThrottles > 0) {
             attributedApp(srcIp, dstIp, srcPort)
         } else {
             null
         }
 
-        val trackersMatch = trackerCandidate &&
+        val trackersMatch = trackerMatch != null &&
             (app == null || PerAppSettings.isTrackerBlockingEnabled(app))
-        val adsMatch = adsCandidate
+        val adsMatchBlocked = adsMatch != null
 
-        if (trackersMatch || adsMatch) {
+        if (trackersMatch || adsMatchBlocked) {
             if ((app != null && app in exemptPackages) || isExemptAppRequest(srcIp, dstIp, srcPort)) {
                 Log.d(TAG, "Не блокируем от исключённого приложения: $qname")
             } else {
@@ -452,15 +449,17 @@ class BlockVpnService : VpnService() {
                     Log.d(TAG, "Пользователь разрешил хост: $qname")
                 } else {
                     val owner = app ?: BlockStats.OTHER
-                    val kind = if (trackersMatch) BlockStats.Kind.TRACKER else BlockStats.Kind.ADS
+                    val isTracker = trackersMatch
+                    val kind = if (isTracker) BlockStats.Kind.TRACKER else BlockStats.Kind.ADS
                     blockedCount.incrementAndGet()
                     BlockStats.record(owner, qname, kind)
                     Log.d(TAG, "Заблокировано: $qname (${kind.name})")
-                    if (trackersMatch) {
+                    val pattern = if (isTracker) trackerMatch else adsMatch
+                    if (isTracker) {
                         applyThrottle(owner)
-                        if (logging) RequestLog.record(owner, qname, RequestLog.Status.TRACKER, srcIpStr, dstIpStr)
+                        if (logging) RequestLog.record(owner, qname, RequestLog.Status.TRACKER, srcIpStr, dstIpStr, pattern)
                     } else if (logging) {
-                        RequestLog.record(owner, qname, RequestLog.Status.ADS, srcIpStr, dstIpStr)
+                        RequestLog.record(owner, qname, RequestLog.Status.ADS, srcIpStr, dstIpStr, pattern)
                     }
                     // NXDOMAIN вместо «тишины»: клиент завершает запрос сразу, без
                     // таймаута и повторов, которые могли бы «проскочить» мимо фильтра.
@@ -488,7 +487,7 @@ class BlockVpnService : VpnService() {
 
         if (logging) {
             val owner = app ?: attributedApp(srcIp, dstIp, srcPort)
-            RequestLog.record(owner, qname, RequestLog.Status.ALLOWED, srcIpStr, dstIpStr)
+            RequestLog.record(owner, qname, RequestLog.Status.ALLOWED, srcIpStr, dstIpStr, null)
         }
 
         // копируем полезную нагрузку: буфер перезапишется следующим чтением

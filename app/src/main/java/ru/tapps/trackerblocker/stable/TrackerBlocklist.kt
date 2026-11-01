@@ -93,21 +93,27 @@ object TrackerBlocklist {
      * ключевых слов в имени хоста.
      */
     fun isBlocked(host: String): Boolean {
+        return findMatch(host) != null
+    }
+
+    /** Возвращает точное правило, по которому хост был заблокирован. */
+    fun findMatch(host: String): String? {
         val value = host.lowercase().trimEnd('.')
-        if (value.isEmpty()) return false
+        if (value.isEmpty()) return null
 
         var suffix = value
         while (true) {
-            if (suffix in domains) return true
+            if (suffix in domains) return suffix
             val dot = suffix.indexOf('.')
             if (dot < 0) break
             suffix = suffix.substring(dot + 1)
         }
 
         for (keyword in keywords) {
-            if (value.contains(keyword)) return true
+            if (keyword.isBlank()) continue
+            if (value.contains(keyword)) return keyword
         }
-        return false
+        return null
     }
 
     fun updateCustom(entries: Set<String>) {

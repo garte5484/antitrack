@@ -13,7 +13,7 @@ import androidx.compose.runtime.mutableStateOf
  */
 object RequestLog {
 
-    const val MAX_ENTRIES = 500
+    const val MAX_ENTRIES = 1000
 
     enum class Status { ALLOWED, TRACKER, ADS, THROTTLE, CUSTOM_BLOCKED }
 
@@ -24,7 +24,8 @@ object RequestLog {
         val host: String,
         val status: Status,
         val srcIp: String? = null,
-        val dstIp: String? = null
+        val dstIp: String? = null,
+        val matchPattern: String? = null
     )
 
     private const val PREF_NAME = "request_log"
@@ -61,7 +62,8 @@ object RequestLog {
         host: String,
         status: Status,
         srcIp: String? = null,
-        dstIp: String? = null
+        dstIp: String? = null,
+        matchPattern: String? = null
     ) {
         if (!isEnabled) return
         synchronized(lock) {
@@ -73,7 +75,8 @@ object RequestLog {
                 host = host,
                 status = status,
                 srcIp = srcIp,
-                dstIp = dstIp
+                dstIp = dstIp,
+                matchPattern = matchPattern
             )
             state.value = (listOf(entry) + state.value).take(MAX_ENTRIES)
         }

@@ -22,7 +22,8 @@ object DomainLabeler {
         "com", "org", "net", "ru", "io", "info", "me", "tv", "us", "uk", "de", "fr", "it",
         "es", "nl", "no", "se", "fi", "dk", "pl", "cz", "ch", "at", "be", "eu", "ua", "by",
         "kz", "am", "ge", "az", "md", "ee", "lv", "lt", "edu", "gov", "mil", "biz", "mobi",
-        "name", "pro", "asia", "su", "ca", "au", "jp", "cn", "in", "br", "mx", "ru"
+        "name", "pro", "asia", "su", "ca", "au", "jp", "cn", "in", "br", "mx", "ru", "site",
+        "online",  "gram"
     )
 
     /**

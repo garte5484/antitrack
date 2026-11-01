@@ -71,7 +71,7 @@ object BlocklistRepository {
                     return
                 }
 
-                if (!hasInternet(app)) {
+                if (!BlocklistRepository.hasInternet(app)) {
                     ensureLoadedLocked(app)
                     return
                 }
@@ -83,11 +83,34 @@ object BlocklistRepository {
                     null
                 }
 
-                if (fresh != null) {
+                if (fresh != null && fresh.isNotEmpty()) {
                     writeCache(app, fresh)
                     apply(fresh)
                 } else {
                     ensureLoadedLocked(app) // загрузка сорвалась — старый кеш
+                }
+            }
+        }
+
+        fun forceRefresh(app: Context) {
+            synchronized(lock) {
+                if (!BlocklistRepository.hasInternet(app)) {
+                    ensureLoadedLocked(app)
+                    return
+                }
+
+                val fresh = try {
+                    download()
+                } catch (e: Exception) {
+                    Log.w(TAG, "$sourceName: не удалось принудительно обновить список по URL", e)
+                    null
+                }
+
+                if (fresh != null && fresh.isNotEmpty()) {
+                    writeCache(app, fresh)
+                    apply(fresh)
+                } else {
+                    ensureLoadedLocked(app)
                 }
             }
         }
@@ -176,8 +199,18 @@ object BlocklistRepository {
      * и при старте VPN-сервиса (не на главном потоке).
      */
     fun refreshIfStale(context: Context) {
-        trackersSource.refreshIfStale(context)
-        adsSource.refreshIfStale(context)
+        val app = context.applicationContext
+        trackersSource.refreshIfStale(app)
+        adsSource.refreshIfStale(app)
+    }
+
+    /** Мгновенное принудительное обновление обоих списков (требуется интернет). */
+    fun forceRefresh(context: Context) {
+        val app = context.applicationContext
+        Thread {
+            trackersSource.forceRefresh(app)
+            adsSource.forceRefresh(app)
+        }.start()
     }
 
     private fun hasInternet(context: Context): Boolean {
@@ -222,8 +255,6 @@ object BlocklistRepository {
         var value = token.trim()
         if (value.isEmpty()) return null
         value = value.removeSuffix(".")
-        if (value.contains('/')) return null // это URL-путь, а не имя хоста
-        if ('*' in value) return null
         if (value in ignoreList) return null
         if (isIpv4(value)) return null
 
