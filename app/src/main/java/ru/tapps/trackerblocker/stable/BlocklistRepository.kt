@@ -31,6 +31,9 @@ object BlocklistRepository {
     private const val KEY_TIMESTAMP = "timestamp"
     private const val KEY_VERSION = "version"
 
+    /** Результат принудительного обновления блоклистов. */
+    enum class RefreshResult { SUCCESS, NO_INTERNET, FAILED }
+
     private val ignoreList = setOf(
         "localhost", "localhost.localdomain", "broadcasthost", "local",
         "ip6-localhost", "ip6-loopback", "ip6-localnet", "ip6-mcastprefix",
@@ -92,13 +95,12 @@ object BlocklistRepository {
             }
         }
 
-        fun forceRefresh(app: Context) {
+        /**
+         * Скачивает список в обход кеша. Возвращает true, если список получен
+         * и применён; иначе поднимает старый кеш и возвращает false.
+         */
+        fun forceRefresh(app: Context): Boolean {
             synchronized(lock) {
-                if (!BlocklistRepository.hasInternet(app)) {
-                    ensureLoadedLocked(app)
-                    return
-                }
-
                 val fresh = try {
                     download()
                 } catch (e: Exception) {
@@ -109,10 +111,16 @@ object BlocklistRepository {
                 if (fresh != null && fresh.isNotEmpty()) {
                     writeCache(app, fresh)
                     apply(fresh)
-                } else {
-                    ensureLoadedLocked(app)
+                    return true
                 }
+                ensureLoadedLocked(app) // загрузка сорвалась — старый кеш
+                return false
             }
+        }
+
+        /** Поднимает сохранённый кеш в память, если список ещё не загружен. */
+        fun loadFromCache(app: Context) {
+            synchronized(lock) { ensureLoadedLocked(app) }
         }
 
         private fun ensureLoadedLocked(app: Context) {
@@ -204,13 +212,22 @@ object BlocklistRepository {
         adsSource.refreshIfStale(app)
     }
 
-    /** Мгновенное принудительное обновление обоих списков (требуется интернет). */
-    fun forceRefresh(context: Context) {
+    /**
+     * Принудительно обновляет оба списка и дожидается результата.
+     * Блокирующий вызов — запускайте не на главном потоке.
+     */
+    fun forceRefresh(context: Context): RefreshResult {
         val app = context.applicationContext
-        Thread {
-            trackersSource.forceRefresh(app)
-            adsSource.forceRefresh(app)
-        }.start()
+        if (!hasInternet(app)) {
+            // Без сети показываем уже сохранённые списки.
+            trackersSource.loadFromCache(app)
+            adsSource.loadFromCache(app)
+            return RefreshResult.NO_INTERNET
+        }
+
+        val trackersOk = trackersSource.forceRefresh(app)
+        val adsOk = adsSource.forceRefresh(app)
+        return if (trackersOk && adsOk) RefreshResult.SUCCESS else RefreshResult.FAILED
     }
 
     private fun hasInternet(context: Context): Boolean {

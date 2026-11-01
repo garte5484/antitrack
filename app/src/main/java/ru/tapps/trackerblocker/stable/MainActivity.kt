@@ -58,6 +58,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -1061,6 +1062,7 @@ private fun LogRow(
 @Composable
 private fun SettingsPlaceholder(modifier: Modifier = Modifier) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var updating by remember { mutableStateOf(false) }
     var message by remember { mutableStateOf<String?>(null) }
 
@@ -1083,21 +1085,22 @@ private fun SettingsPlaceholder(modifier: Modifier = Modifier) {
             onClick = {
                 updating = true
                 message = null
-                Thread {
-                    BlocklistRepository.forceRefresh(context)
-                    android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                        updating = false
-                        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
-                        val network = cm?.activeNetwork
-                        val caps = network?.let { cm.getNetworkCapabilities(it) }
-                        val hasNet = caps?.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
-                        message = if (hasNet) {
-                            context.getString(R.string.settings_update_blocklists_done)
-                        } else {
-                            context.getString(R.string.settings_update_blocklists_no_internet)
+                scope.launch {
+                    val result = withContext(Dispatchers.IO) {
+                        BlocklistRepository.forceRefresh(context)
+                    }
+                    updating = false
+                    message = context.getString(
+                        when (result) {
+                            BlocklistRepository.RefreshResult.SUCCESS ->
+                                R.string.settings_update_blocklists_done
+                            BlocklistRepository.RefreshResult.NO_INTERNET ->
+                                R.string.settings_update_blocklists_no_internet
+                            BlocklistRepository.RefreshResult.FAILED ->
+                                R.string.settings_update_blocklists_failed
                         }
-                    }, 2500)
-                }.start()
+                    )
+                }
             },
             enabled = !updating
         ) {

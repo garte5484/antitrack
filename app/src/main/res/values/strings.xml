@@ -83,5 +83,6 @@
     <string name="settings_update_blocklists">Обновить блоклисты</string>
     <string name="settings_update_blocklists_done">Блоклисты обновлены</string>
     <string name="settings_update_blocklists_no_internet">Нет подключения к интернету</string>
+    <string name="settings_update_blocklists_failed">Не удалось обновить блоклисты</string>
     <string name="settings_placeholder">Раздел «Настройки» пока в разработке.</string>
 </resources>
