@@ -192,6 +192,17 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun toggleVpn() {
+        if (BlockVpnService.isWaitingForOtherVpn) {
+            // Кнопка на главном экране в этом состоянии означает «Включить
+            // сейчас»: пользователь явно просит вернуть защиту и вытеснить
+            // чужой VPN.
+            Log.i("MainActivity", "toggleVpn: вернуть защиту немедленно")
+            startService(
+                Intent(this, BlockVpnService::class.java)
+                    .setAction(BlockVpnService.ACTION_RESUME_NOW)
+            )
+            return
+        }
         if (BlockVpnService.isRunning) {
             Log.i("MainActivity", "toggleVpn: ВЫКЛ (isRunning=true)")
             val intent = Intent(this, BlockVpnService::class.java)

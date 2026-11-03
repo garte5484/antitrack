@@ -135,6 +135,13 @@ class BlockVpnService : VpnService() {
     /** С какого момента чужого VPN не видно; 0 — виден или ещё не проверяли. */
     private var noVpnSinceMs = 0L
 
+    /** Когда началось ожидание: страховка на случай, если чужой VPN не виден. */
+    private var waitStartedMs = 0L
+
+    /** VPN-сети, замеченные подпиской. Наличие любой означает чужой VPN. */
+    private val vpnNetworks: MutableSet<Network> =
+        java.util.Collections.newSetFromMap(java.util.concurrent.ConcurrentHashMap<Network, Boolean>())
+
     private var resumeAttempts = 0
 
     private var resumeVpnWatcher: ConnectivityManager.NetworkCallback? = null
@@ -370,11 +377,26 @@ class BlockVpnService : VpnService() {
 
         /** Как часто перепроверяем, не отключился ли чужой VPN. */
         private const val RESUME_POLL_MS = 5_000L
-        /** Пауза «чужого VPN не видно»: даём ему время подняться. */
-        private const val RESUME_GRACE_MS = 6_000L
+        /**
+         * Пауза после исчезновения чужого VPN. VPN-приложения могут
+         * переподключаться, поэтому спешить с establish() нельзя: иначе мы
+         * отберём слот у только что поднявшегося чужого туннеля.
+         */
+        private const val RESUME_GRACE_MS = 15_000L
+        /**
+         * Если чужой VPN так и не стал виден (приложение упало при запуске),
+         * ждём достаточно долго, чтобы не мешать медленному подключению.
+         */
+        private const val RESUME_UNSEEN_MS = 45_000L
         /** Задержка перед повторной попыткой, если establish() не удался. */
         private const val RESUME_RETRY_MS = 15_000L
         private const val RESUME_MAX_ATTEMPTS = 5
+
+        /**
+         * Пауза после перезапуска сервиса системой (intent == null): даём
+         * чужому VPN проявиться, чтобы не выбить его из слота сразу.
+         */
+        private const val SYSTEM_RESTART_SETTLE_MS = 4_000L
 
         @Volatile
         var isRunning = false
@@ -456,7 +478,7 @@ class BlockVpnService : VpnService() {
                 Log.i(TAG, "Возврат защиты по команде пользователя")
                 stopWaitingForOtherVpn()
                 showNotification()
-                startVpn()
+                startVpn(force = true)
                 return START_STICKY
             }
             ACTION_REFRESH -> {
@@ -466,16 +488,28 @@ class BlockVpnService : VpnService() {
                 if (running && excludedPackages() != appliedExcludedPackages) {
                     Log.i(TAG, "Состав исключённых приложений изменился — пересоздаю туннель")
                     teardown()
-                    startVpn()
+                    // Слот только что был наш: не путаем собственную
+                    // закрывающуюся сеть с чужим VPN.
+                    startVpn(force = true)
                 }
                 showNotification()
                 return START_STICKY
             }
         }
-        // Система перезапустила сервис (intent == null) уже после того, как
-        // слот VPN заняло другое приложение: не отбираем его, а ждём.
-        if (intent == null && isOtherVpnActive()) {
-            beginWaitingForOtherVpn()
+        // Система перезапустила сервис (intent == null), например при
+        // «Постоянной VPN»: не спешим с establish(). Чужой VPN мог
+        // подключиться одновременно с нашим перезапуском и ещё не проявился
+        // в списке сетей — иначе мы бы его сразу выбили из слота.
+        if (intent == null) {
+            showNotification()
+            if (otherVpnPresent()) {
+                beginWaitingForOtherVpn()
+                return START_STICKY
+            }
+            notifyHandler.postDelayed({
+                if (running || !AppSettings.isProtectionEnabled()) return@postDelayed
+                if (otherVpnPresent()) beginWaitingForOtherVpn() else startVpn()
+            }, SYSTEM_RESTART_SETTLE_MS)
             return START_STICKY
         }
         // Обычный запуск (в том числе из MainActivity) отменяет ожидание:
@@ -508,6 +542,17 @@ class BlockVpnService : VpnService() {
         val shouldResume = AppSettings.isProtectionEnabled()
         teardown()
         if (shouldResume) {
+            // Если VPN-сети не видно, это могло быть не вытеснение чужим VPN,
+            // а ручной отзыв согласия в настройках Android. Проверяем сразу,
+            // чтобы не показывать ложное «Другой VPN активен».
+            if (!otherVpnPresent() && VpnService.prepare(this) != null) {
+                Log.i(TAG, "Согласие на VPN отозвано — защита выключена")
+                AppSettings.setProtectionEnabled(false)
+                AppSettings.setAutostartResult(AppSettings.AUTOSTART_NO_CONSENT)
+                stopSelf()
+                super.onRevoke()
+                return
+            }
             // Не вызываем super: его реализация делает stopSelf(), а сервис
             // должен остаться жив, чтобы вернуть защиту после чужого VPN.
             notifyHandler.post { beginWaitingForOtherVpn() }
@@ -518,11 +563,20 @@ class BlockVpnService : VpnService() {
 
     // ————————————————————— включение/выключение —————————————————————
 
-    private fun startVpn(keepAliveOnFailure: Boolean = false): Boolean =
+    private fun startVpn(keepAliveOnFailure: Boolean = false, force: Boolean = false): Boolean =
         synchronized(lifecycleLock) {
             if (running) {
                 Log.i(TAG, "startVpn пропущен: уже работает")
                 return@synchronized true
+            }
+            // Никогда не отбираем слот у другого VPN без явной команды
+            // пользователя: establish() мгновенно отключает чужой туннель.
+            if (!force && otherVpnPresent()) {
+                Log.i(TAG, "Запуск отложен: активен другой VPN")
+                if (!awaitingOtherVpn) {
+                    notifyHandler.post { beginWaitingForOtherVpn() }
+                }
+                return@synchronized false
             }
             val tun = buildTunnel()
             if (tun == null) {
@@ -674,15 +728,34 @@ class BlockVpnService : VpnService() {
         awaitingOtherVpn = true
         isWaitingForOtherVpn = true
         resumeAttempts = 0
-        sawOtherVpn = isOtherVpnActive()
-        noVpnSinceMs = if (sawOtherVpn) 0L else System.currentTimeMillis()
-        Log.i(TAG, "Другой VPN активен — защита вернётся после его отключения")
+        // Таймер запускаем не от момента onRevoke, а от момента, когда чужой
+        // VPN реально исчез: нередко он подключается несколько секунд, и
+        // ранний establish() просто выбил бы его из слота.
+        sawOtherVpn = false
+        noVpnSinceMs = 0L
+        waitStartedMs = System.currentTimeMillis()
+        Log.i(TAG, "Ждём освобождения слота VPN (другой VPN активен)")
+        if (isAlwaysOnVpn()) {
+            // При «Постоянной VPN» систему сама перезапускает наш сервис и
+            // вытесняет чужой туннель — это ограничение Android, а не наш
+            // таймер. Пишем в лог, чтобы причина была видна.
+            Log.w(TAG, "AntiTrack назначен постоянной VPN: другие VPN будут вытесняться системой")
+        }
         registerResumeWatcher()
         showNotification()
         notifyHandler.removeCallbacks(resumePollRunnable)
         notifyHandler.postDelayed(resumePollRunnable, RESUME_POLL_MS)
-        // Проверяем сразу: если согласие отозвано, ждать бессмысленно.
-        checkOtherVpnState()
+    }
+
+    /** Назначено ли наше приложение «Постоянной VPN» в настройках Android. */
+    private fun isAlwaysOnVpn(): Boolean = try {
+        // Константа Settings.Secure.ALWAYS_ON_VPN_APP скрыта в публичном SDK.
+        android.provider.Settings.Secure.getString(
+            contentResolver,
+            "always_on_vpn_app"
+        ) == packageName
+    } catch (e: Exception) {
+        false
     }
 
     /**
@@ -701,12 +774,29 @@ class BlockVpnService : VpnService() {
         }
 
         val now = System.currentTimeMillis()
-        if (isOtherVpnActive()) {
+        if (otherVpnPresent()) {
             // Чужой VPN на месте — ничего не делаем. prepare() в этот момент
             // не вызываем, чтобы не вмешиваться в его работу.
+            if (!sawOtherVpn) Log.i(TAG, "Другой VPN подключён — ждём его отключения")
             sawOtherVpn = true
             noVpnSinceMs = 0L
             return
+        }
+
+        if (sawOtherVpn) {
+            // Чужой VPN был и пропал. Ждём: он может переподключаться.
+            if (noVpnSinceMs == 0L) {
+                noVpnSinceMs = now
+                Log.i(TAG, "Другой VPN отключился — проверяем через ${RESUME_GRACE_MS / 1000} с")
+                return
+            }
+            if (now - noVpnSinceMs < RESUME_GRACE_MS) return
+        } else {
+            // Чужой VPN так и не появился: возможно, приложение не смогло
+            // подключиться. Ждём с большим запасом, чтобы не украсть слот у
+            // медленно устанавливающегося туннеля.
+            if (now - waitStartedMs < RESUME_UNSEEN_MS) return
+            Log.i(TAG, "Другой VPN так и не появился — возвращаем защиту")
         }
 
         // Пользователь отозвал согласие (выключил VPN в системных настройках).
@@ -720,14 +810,6 @@ class BlockVpnService : VpnService() {
             return
         }
 
-        if (noVpnSinceMs == 0L) {
-            noVpnSinceMs = now
-            return
-        }
-        // Если чужой VPN так и не появился (например, приложение упало при
-        // запуске), даём ему больше времени, чтобы не отобрать слот раньше.
-        val grace = if (sawOtherVpn) RESUME_GRACE_MS else RESUME_GRACE_MS * 2
-        if (now - noVpnSinceMs < grace) return
         resumeProtection()
     }
 
@@ -736,8 +818,18 @@ class BlockVpnService : VpnService() {
         awaitingOtherVpn = false
         notifyHandler.removeCallbacks(resumePollRunnable)
         unregisterResumeWatcher()
-        Log.i(TAG, "Другой VPN отключён — возвращаю защиту")
+        Log.i(TAG, "Слот свободен — возвращаю защиту")
         Thread {
+            // Ещё раз проверяем прямо перед establish(): чужой VPN мог
+            // подключиться между проверкой и этим моментом.
+            if (otherVpnPresent()) {
+                Log.i(TAG, "Перед запуском снова обнаружен чужой VPN — продолжаем ждать")
+                notifyHandler.post {
+                    resumeAttempts = 0
+                    beginWaitingForOtherVpn()
+                }
+                return@Thread
+            }
             val started = startVpn(keepAliveOnFailure = true)
             notifyHandler.post {
                 when {
@@ -747,18 +839,24 @@ class BlockVpnService : VpnService() {
                         showNotification()
                     }
                     !AppSettings.isProtectionEnabled() -> stopSelf()
+                    otherVpnPresent() -> {
+                        // Слот снова заняли — возвращаемся в ожидание,
+                        // не расходуя попытки.
+                        resumeAttempts = 0
+                        beginWaitingForOtherVpn()
+                    }
                     resumeAttempts + 1 >= RESUME_MAX_ATTEMPTS -> {
                         Log.w(TAG, "Не удалось вернуть защиту после другого VPN")
                         isWaitingForOtherVpn = false
                         stopSelf()
                     }
                     else -> {
-                        // Слот могли снова занять — продолжаем ждать.
                         resumeAttempts++
                         awaitingOtherVpn = true
                         isWaitingForOtherVpn = true
-                        sawOtherVpn = isOtherVpnActive()
-                        noVpnSinceMs = System.currentTimeMillis()
+                        sawOtherVpn = false
+                        noVpnSinceMs = 0L
+                        waitStartedMs = System.currentTimeMillis()
                         registerResumeWatcher()
                         showNotification()
                         notifyHandler.postDelayed(resumePollRunnable, RESUME_RETRY_MS)
@@ -771,8 +869,15 @@ class BlockVpnService : VpnService() {
         }.start()
     }
 
-    /** true, если сейчас активен VPN — наш собственный уже закрыт. */
-    private fun isOtherVpnActive(): Boolean {
+    /**
+     * true, если сейчас активен хоть какой-то VPN. Наш собственный в момент
+     * ожидания уже закрыт, поэтому любая VPN-сеть — чужая.
+     *
+     * Используем три источника: замеченные подпиской сети, активную сеть и
+     * общий список. На разных версиях Android чужая VPN видна по-разному.
+     */
+    private fun otherVpnPresent(): Boolean {
+        if (vpnNetworks.isNotEmpty()) return true
         val cm = getSystemService(ConnectivityManager::class.java) ?: return false
         val active = cm.activeNetwork
         if (active != null && cm.getNetworkCapabilities(active)
@@ -781,7 +886,6 @@ class BlockVpnService : VpnService() {
             return true
         }
         return try {
-            // VPN другого приложения иногда виден только в общем списке сетей.
             cm.allNetworks.any { network ->
                 cm.getNetworkCapabilities(network)
                     ?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
@@ -792,6 +896,23 @@ class BlockVpnService : VpnService() {
         }
     }
 
+    /** Запоминает/забывает VPN-сеть, чтобы не пропустить чужой туннель. */
+    private fun noteVpnNetwork(network: Network, present: Boolean) {
+        if (present) {
+            if (vpnNetworks.add(network)) {
+                Log.i(TAG, "Замечена VPN-сеть другого приложения")
+            }
+        } else {
+            vpnNetworks.remove(network)
+        }
+    }
+
+    private fun isVpnNetwork(network: Network): Boolean {
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return false
+        return cm.getNetworkCapabilities(network)
+            ?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
+    }
+
     /** Подписка на появление/исчезновение VPN и смену обычной сети. */
     private fun registerResumeWatcher() {
         if (resumeVpnWatcher != null || resumeDefaultWatcher != null) return
@@ -799,10 +920,12 @@ class BlockVpnService : VpnService() {
 
         val vpnCallback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
+                noteVpnNetwork(network, present = true)
                 notifyHandler.post { checkOtherVpnState() }
             }
 
             override fun onLost(network: Network) {
+                noteVpnNetwork(network, present = false)
                 notifyHandler.post { checkOtherVpnState() }
             }
 
@@ -810,6 +933,10 @@ class BlockVpnService : VpnService() {
                 network: Network,
                 networkCapabilities: NetworkCapabilities
             ) {
+                noteVpnNetwork(
+                    network,
+                    present = networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+                )
                 notifyHandler.post { checkOtherVpnState() }
             }
         }
@@ -820,7 +947,7 @@ class BlockVpnService : VpnService() {
                     // API 31+: видеть VPN-сети, которые не применяются к нам
                     // (чужой VPN с раздельным туннелированием).
                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                        setIncludeOtherUidNetworks(true)
+                        runCatching { setIncludeOtherUidNetworks(true) }
                     }
                 }
                 .build()
@@ -832,10 +959,23 @@ class BlockVpnService : VpnService() {
 
         val defaultCallback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
+                if (isVpnNetwork(network)) noteVpnNetwork(network, present = true)
                 notifyHandler.post { checkOtherVpnState() }
             }
 
             override fun onLost(network: Network) {
+                noteVpnNetwork(network, present = false)
+                notifyHandler.post { checkOtherVpnState() }
+            }
+
+            override fun onCapabilitiesChanged(
+                network: Network,
+                networkCapabilities: NetworkCapabilities
+            ) {
+                noteVpnNetwork(
+                    network,
+                    present = networkCapabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+                )
                 notifyHandler.post { checkOtherVpnState() }
             }
         }
@@ -853,6 +993,7 @@ class BlockVpnService : VpnService() {
         resumeVpnWatcher = null
         resumeDefaultWatcher?.let { runCatching { cm?.unregisterNetworkCallback(it) } }
         resumeDefaultWatcher = null
+        vpnNetworks.clear()
     }
 
     private fun stopWaitingForOtherVpn() {
