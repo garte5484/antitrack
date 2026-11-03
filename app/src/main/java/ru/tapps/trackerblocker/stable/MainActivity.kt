@@ -52,6 +52,7 @@ import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
@@ -66,6 +67,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -213,6 +215,9 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun startVpnService() {
+        // Запоминаем намерение пользователя: после перезагрузки BootReceiver
+        // поднимет защиту автоматически.
+        AppSettings.setProtectionEnabled(true)
         val intent = Intent(this, BlockVpnService::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             startForegroundService(intent)
@@ -311,6 +316,74 @@ private fun hasUsageAccess(context: Context): Boolean {
     return mode == AppOpsManager.MODE_ALLOWED
 }
 
+/**
+ * Системный экран «Постоянная VPN». Это самый надёжный автозапуск: после
+ * перезагрузки VPN поднимает сама Android, без BOOT_COMPLETED и без
+ * разрешения автозапуска производителя.
+ */
+private fun openVpnSettings(context: Context) {
+    try {
+        context.startActivity(Intent(Settings.ACTION_VPN_SETTINGS))
+    } catch (_: Exception) {
+        runCatching { context.startActivity(Intent(Settings.ACTION_SETTINGS)) }
+    }
+}
+
+/**
+ * «Частный DNS» (Private DNS) в Android. Если он включён в режиме
+ * «Имя хоста», DoT-запросы уходят мимо VPN-резолвера, и фильтрация
+ * частично обходится — об этом стоит предупредить пользователя.
+ */
+private fun openPrivateDnsSettings(context: Context) {
+    try {
+        // Строка действия не входит в публичные константы Settings,
+        // поэтому используем её напрямую.
+        context.startActivity(Intent("android.settings.PRIVATE_DNS_SETTINGS"))
+    } catch (_: Exception) {
+        runCatching { context.startActivity(Intent(Settings.ACTION_WIRELESS_SETTINGS)) }
+            .recoverCatching { context.startActivity(Intent(Settings.ACTION_SETTINGS)) }
+    }
+}
+
+/**
+ * Экран автозапуска у производителей. На ColorOS (Oppo, Realme, OnePlus),
+ * MIUI и EMUI без этого разрешения broadcast BOOT_COMPLETED приложению
+ * не доставляется, и защита после перезагрузки не поднимается.
+ */
+private fun openAutostartSettings(context: Context) {
+    val candidates = listOf(
+        "com.coloros.safecenter" to "com.coloros.safecenter.permission.startup.StartupAppListActivity",
+        "com.coloros.safecenter" to "com.coloros.safecenter.startupapp.StartupAppListActivity",
+        "com.oplus.safecenter" to "com.oplus.safecenter.permission.startup.StartupAppListActivity",
+        "com.oplus.safecenter" to "com.oplus.safecenter.startupapp.StartupAppListActivity",
+        "com.oppo.safe" to "com.oppo.safe.permission.startup.StartupAppListActivity",
+        "com.oneplus.security" to "com.oneplus.security.chainlaunch.view.ChainLaunchAppListActivity",
+        "com.miui.securitycenter" to "com.miui.permcenter.autostart.AutoStartManagementActivity",
+        "com.huawei.systemmanager" to "com.huawei.systemmanager.startupmgr.ui.StartupNormalAppListActivity",
+        "com.vivo.permissionmanager" to "com.vivo.permissionmanager.activity.BgStartUpManagerActivity",
+        "com.iqoo.secure" to "com.iqoo.secure.ui.phoneoptimize.AddWhiteListActivity"
+    )
+    for ((pkg, cls) in candidates) {
+        try {
+            context.startActivity(
+                Intent().setClassName(pkg, cls).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+            return
+        } catch (_: Exception) {
+            // на этой прошивке такого экрана нет — пробуем следующий
+        }
+    }
+    // Фолбэк: карточка приложения, откуда настройки автозапуска тоже доступны.
+    try {
+        context.startActivity(
+            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                .setData(Uri.parse("package:" + context.packageName))
+        )
+    } catch (_: Exception) {
+        runCatching { context.startActivity(Intent(Settings.ACTION_SETTINGS)) }
+    }
+}
+
 private enum class AppTab(val labelRes: Int, val iconRes: Int) {
     HOME(R.string.tab_home, R.drawable.ic_tab_home),
     LOGS(R.string.tab_logs, R.drawable.ic_tab_logs),
@@ -327,6 +400,7 @@ fun AntiTrackScreen(
     onDismissUpdate: () -> Unit = {}
 ) {
     var isRunning by remember { mutableStateOf(BlockVpnService.isRunning) }
+    var waitingForOtherVpn by remember { mutableStateOf(BlockVpnService.isWaitingForOtherVpn) }
     var selectedApp by remember { mutableStateOf<String?>(null) }
     var blockTrackers by remember { mutableStateOf(AppSettings.blockTrackers()) }
     var blockAds by remember { mutableStateOf(AppSettings.blockAds()) }
@@ -336,10 +410,12 @@ fun AntiTrackScreen(
     val context = LocalContext.current
     var usageAccess by remember { mutableStateOf(hasUsageAccess(context)) }
     val stats by BlockStats.state
+    var statsPeriod by rememberSaveable { mutableStateOf(BlockStats.Period.ALL) }
+    val periodStats = remember(stats, statsPeriod) { BlockStats.statsFor(statsPeriod) }
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
 
-    // Переключатели влияют на текст уведомления, пока сервис работает.
-    val refreshServiceNotification = {
+    // Настройки влияют на текст уведомления и состав исключённых из VPN приложений.
+    val applyServiceSettings = {
         if (BlockVpnService.isRunning) {
             context.startService(
                 Intent(context, BlockVpnService::class.java)
@@ -358,6 +434,7 @@ fun AntiTrackScreen(
         }
     }
     val statusText = when {
+        waitingForOtherVpn -> stringResource(R.string.status_waiting)
         !isRunning -> stringResource(R.string.status_off)
         paused -> stringResource(R.string.status_paused)
         blockTrackers && blockAds -> stringResource(R.string.status_on_all)
@@ -367,6 +444,7 @@ fun AntiTrackScreen(
     }
     val cannotStart = !isRunning && !blockTrackers && !blockAds
     val statusDescription = when {
+        waitingForOtherVpn -> stringResource(R.string.status_description_waiting)
         !isRunning -> stringResource(R.string.status_description_off)
         paused -> stringResource(R.string.status_description_paused, pausedUntilText)
         blockTrackers && blockAds -> stringResource(R.string.status_description_all)
@@ -375,12 +453,20 @@ fun AntiTrackScreen(
         else -> stringResource(R.string.status_description_on)
     }
 
-    val totalTrackers = stats.values.sumOf { pkg -> pkg.values.sumOf { it.trackers } }.toInt()
-    val totalAds = stats.values.sumOf { pkg -> pkg.values.sumOf { it.ads } }.toInt()
+    val totalTrackers = periodStats.values.sumOf { pkg -> pkg.values.sumOf { it.trackers } }.toInt()
+    val totalAds = periodStats.values.sumOf { pkg -> pkg.values.sumOf { it.ads } }.toInt()
     val totalBlocks = totalTrackers + totalAds
-    val appCount = stats.size
+    val appCount = periodStats.size
+    val summaryPrefix = stringResource(
+        when (statsPeriod) {
+            BlockStats.Period.TODAY -> R.string.stats_summary_today
+            BlockStats.Period.WEEK -> R.string.stats_summary_week
+            BlockStats.Period.ALL -> R.string.stats_summary_all
+        }
+    )
     val statsSummary = buildString {
-        append("Всего заблокировано ")
+        append(summaryPrefix)
+        append(' ')
         append(totalBlocks)
         append(" (")
         append(totalTrackers)
@@ -399,6 +485,7 @@ fun AntiTrackScreen(
     LaunchedEffect(Unit) {
         while (true) {
             isRunning = BlockVpnService.isRunning
+            waitingForOtherVpn = BlockVpnService.isWaitingForOtherVpn
             paused = AppSettings.isPaused()
             usageAccess = hasUsageAccess(context)
             delay(500)
@@ -542,6 +629,30 @@ fun AntiTrackScreen(
                 }
             }
 
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .horizontalScroll(rememberScrollState())
+                    .padding(horizontal = 24.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                FilterChip(
+                    selected = statsPeriod == BlockStats.Period.TODAY,
+                    onClick = { statsPeriod = BlockStats.Period.TODAY },
+                    label = { Text(stringResource(R.string.stats_period_today)) }
+                )
+                FilterChip(
+                    selected = statsPeriod == BlockStats.Period.WEEK,
+                    onClick = { statsPeriod = BlockStats.Period.WEEK },
+                    label = { Text(stringResource(R.string.stats_period_week)) }
+                )
+                FilterChip(
+                    selected = statsPeriod == BlockStats.Period.ALL,
+                    onClick = { statsPeriod = BlockStats.Period.ALL },
+                    label = { Text(stringResource(R.string.stats_period_all)) }
+                )
+            }
+
             if (!usageAccess) {
                 Surface(
                     onClick = {
@@ -562,9 +673,12 @@ fun AntiTrackScreen(
                 }
             }
 
-            if (stats.isEmpty()) {
+            if (periodStats.isEmpty()) {
                 Text(
-                    text = stringResource(R.string.stats_empty),
+                    text = stringResource(
+                        if (statsPeriod == BlockStats.Period.ALL) R.string.stats_empty
+                        else R.string.stats_empty_period
+                    ),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier
@@ -573,7 +687,7 @@ fun AntiTrackScreen(
                     textAlign = TextAlign.Center
                 )
             } else {
-                val rows = stats.entries.sortedByDescending { entry -> entry.value.values.sumOf { it.total } }
+                val rows = periodStats.entries.sortedByDescending { entry -> entry.value.values.sumOf { it.total } }
                 LazyColumn(modifier = Modifier.fillMaxSize()) {
                     items(rows, key = { it.key }) { (pkg, labels) ->
                         AppRow(
@@ -597,13 +711,14 @@ fun AntiTrackScreen(
                 onBlockTrackersChange = {
                     blockTrackers = it
                     AppSettings.setBlockTrackers(it)
-                    refreshServiceNotification()
+                    applyServiceSettings()
                 },
                 onBlockAdsChange = {
                     blockAds = it
                     AppSettings.setBlockAds(it)
-                    refreshServiceNotification()
+                    applyServiceSettings()
                 },
+                onExclusionsChanged = applyServiceSettings,
                 onOpenRules = { showRules = true }
             )
         }
@@ -635,11 +750,11 @@ fun AntiTrackScreen(
                 }
                 .sortedByDescending { it.second }
 
-        val trackerRows = remember(stats, dialogApp) {
-            companyRows(stats[dialogApp].orEmpty(), trackersTab = true)
+        val trackerRows = remember(periodStats, dialogApp) {
+            companyRows(periodStats[dialogApp].orEmpty(), trackersTab = true)
         }
-        val adsRows = remember(stats, dialogApp) {
-            companyRows(stats[dialogApp].orEmpty(), trackersTab = false)
+        val adsRows = remember(periodStats, dialogApp) {
+            companyRows(periodStats[dialogApp].orEmpty(), trackersTab = false)
         }
 
         val tabs = buildList {
@@ -652,6 +767,21 @@ fun AntiTrackScreen(
             CompanyTab.TRACKERS -> trackerRows
             CompanyTab.ADS -> adsRows
         }
+
+        // Проценты считаем внутри текущей вкладки: сравнивать трекеры с
+        // рекламой некорректно, иначе все трекеры казались бы «малыми» на
+        // фоне приложения с интенсивной рекламой.
+        val rowsTotal = rows.sumOf { it.second }
+
+        fun isMetaBrand(name: String): Boolean {
+            val lower = name.lowercase()
+            return lower.contains("facebook") || lower.contains("instagram") || lower.contains("meta")
+        }
+
+        /** Мало блокировок: меньше 30 или меньше 15% от всех на вкладке. */
+        fun isLowConfidence(count: Long): Boolean =
+            count < 30L || count.toDouble() < rowsTotal * 0.15
+
         var blockTrackersForApp by remember(dialogApp) { mutableStateOf(PerAppSettings.isTrackerBlockingEnabled(dialogApp)) }
         ModalBottomSheet(
             onDismissRequest = { selectedApp = null },
@@ -675,7 +805,13 @@ fun AntiTrackScreen(
                         onCheckedChange = { value ->
                             blockTrackersForApp = value
                             PerAppSettings.setTrackerBlockingEnabled(dialogApp, value)
+                            applyServiceSettings()
                         }
+                    )
+                    Text(
+                        text = stringResource(R.string.settings_app_excluded_hint),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Spacer(Modifier.height(4.dp))
                 }
@@ -723,10 +859,15 @@ fun AntiTrackScreen(
                                 LabelAvatar(domain = host, size = 32.dp)
                                 Spacer(Modifier.width(12.dp))
                                 Text(
-                                    text = name,
+                                    text = when {
+                                        isMetaBrand(name) -> "$name**"
+                                        dialogApp != BlockStats.OTHER && isLowConfidence(count) -> "$name*"
+                                        else -> name
+                                    },
                                     style = MaterialTheme.typography.bodyMedium,
                                     modifier = Modifier.weight(1f)
                                 )
+
                                 Spacer(Modifier.width(8.dp))
                                 Text(
                                     count.toString(),
@@ -737,6 +878,31 @@ fun AntiTrackScreen(
                     }
                 }
                 Spacer(Modifier.height(12.dp))
+                if (dialogApp != BlockStats.OTHER &&
+                    rows.any { !isMetaBrand(it.first) && isLowConfidence(it.second) }
+                ) {
+                    Text(
+                        text = stringResource(R.string.stats_possible_misattribution),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(24.dp),
+                        textAlign = TextAlign.Center
+                    )
+                }
+                if (rows.any { isMetaBrand(it.first) }) {
+                    Text(
+                        text = stringResource(R.string.stats_meta_affiliation_note),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(24.dp),
+                        textAlign = TextAlign.Center
+                    )
+                }
+
                 Button(
                     onClick = { selectedApp = null },
                     modifier = Modifier.align(Alignment.End)
@@ -1163,6 +1329,7 @@ private fun SettingsScreen(
     usageAccess: Boolean,
     onBlockTrackersChange: (Boolean) -> Unit,
     onBlockAdsChange: (Boolean) -> Unit,
+    onExclusionsChanged: () -> Unit,
     onOpenRules: () -> Unit
 ) {
     val context = LocalContext.current
@@ -1170,6 +1337,35 @@ private fun SettingsScreen(
     var updating by remember { mutableStateOf(false) }
     var message by remember { mutableStateOf<String?>(null) }
     var lastUpdated by remember { mutableStateOf(BlocklistRepository.lastUpdated(context)) }
+    var excluded by remember { mutableStateOf(PerAppSettings.disabledTrackerPackages()) }
+    var dnsProviderId by remember { mutableStateOf(AppSettings.dnsProviderId()) }
+    var customDns by remember { mutableStateOf(AppSettings.customDnsRaw()) }
+    var dnsEncrypt by remember { mutableStateOf(AppSettings.dnsEncryptionEnabled()) }
+    var blockNull by remember { mutableStateOf(AppSettings.blockWithNullAddress()) }
+    val selectedProvider = DnsProviders.byId(dnsProviderId)
+    // «Частный DNS» в режиме «Имя хоста» уводит DoT мимо VPN-резолвера.
+    val privateDnsForced = remember {
+        runCatching {
+            Settings.Global.getString(context.contentResolver, "private_dns_mode")
+        }.getOrNull() == "hostname"
+    }
+    val autostartAt = remember { AppSettings.lastAutostartAt() }
+    val autostartResult = remember { AppSettings.lastAutostartResult() }
+    val autostartStatus = if (autostartAt == 0L) {
+        stringResource(R.string.settings_autostart_never)
+    } else {
+        val time = SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault()).format(Date(autostartAt))
+        val resultText = stringResource(
+            when (autostartResult) {
+                AppSettings.AUTOSTART_STARTED -> R.string.settings_autostart_started
+                AppSettings.AUTOSTART_REQUESTED -> R.string.settings_autostart_requested
+                AppSettings.AUTOSTART_NO_CONSENT -> R.string.settings_autostart_no_consent
+                AppSettings.AUTOSTART_ERROR -> R.string.settings_autostart_error
+                else -> R.string.settings_autostart_disabled
+            }
+        )
+        stringResource(R.string.settings_autostart_last, time, resultText)
+    }
     val updatedAt = remember(lastUpdated) {
         if (lastUpdated == 0L) null
         else SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault()).format(Date(lastUpdated))
@@ -1198,6 +1394,177 @@ private fun SettingsScreen(
             checked = blockAds,
             onCheckedChange = onBlockAdsChange
         )
+
+        Spacer(Modifier.height(20.dp))
+        SectionTitle(stringResource(R.string.settings_section_dns))
+        Text(
+            text = stringResource(R.string.settings_dns_hint),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Spacer(Modifier.height(4.dp))
+        DnsProviders.all.forEach { provider ->
+            SettingsRadioRow(
+                text = stringResource(provider.nameRes),
+                selected = dnsProviderId == provider.id,
+                onClick = {
+                    dnsProviderId = provider.id
+                    AppSettings.setDnsProviderId(provider.id)
+                }
+            )
+        }
+        if (selectedProvider.custom) {
+            Spacer(Modifier.height(4.dp))
+            OutlinedTextField(
+                value = customDns,
+                onValueChange = {
+                    customDns = it
+                    AppSettings.setCustomDnsRaw(it)
+                },
+                label = { Text(stringResource(R.string.settings_dns_custom_hint)) },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth()
+            )
+            Text(
+                text = stringResource(R.string.settings_dns_custom_warning),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error
+            )
+        }
+        if (!selectedProvider.worksInRussia) {
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = stringResource(R.string.settings_dns_russia_warning),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error
+            )
+        }
+        if (selectedProvider.dotHost != null) {
+            Spacer(Modifier.height(8.dp))
+            SettingsSwitch(
+                text = stringResource(R.string.settings_dns_encrypt),
+                checked = dnsEncrypt,
+                onCheckedChange = {
+                    dnsEncrypt = it
+                    AppSettings.setDnsEncryptionEnabled(it)
+                }
+            )
+            Text(
+                text = stringResource(R.string.settings_dns_encrypt_hint),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        Spacer(Modifier.height(8.dp))
+        Text(
+            text = stringResource(
+                if (privateDnsForced) R.string.settings_dns_private_enabled_warning
+                else R.string.settings_dns_private_hint
+            ),
+            style = MaterialTheme.typography.bodySmall,
+            color = if (privateDnsForced) MaterialTheme.colorScheme.error
+            else MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Spacer(Modifier.height(4.dp))
+        OutlinedButton(onClick = { openPrivateDnsSettings(context) }) {
+            Text(stringResource(R.string.settings_dns_private_open))
+        }
+
+        Spacer(Modifier.height(20.dp))
+        SectionTitle(stringResource(R.string.settings_section_block_response))
+        SettingsRadioRow(
+            text = stringResource(R.string.settings_block_response_nxdomain),
+            selected = !blockNull,
+            onClick = {
+                blockNull = false
+                AppSettings.setBlockWithNullAddress(false)
+            }
+        )
+        SettingsRadioRow(
+            text = stringResource(R.string.settings_block_response_null),
+            selected = blockNull,
+            onClick = {
+                blockNull = true
+                AppSettings.setBlockWithNullAddress(true)
+            }
+        )
+        Text(
+            text = stringResource(R.string.settings_block_response_hint),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+
+        Spacer(Modifier.height(20.dp))
+        SectionTitle(stringResource(R.string.settings_section_autostart))
+        Text(
+            text = stringResource(R.string.settings_autostart_hint),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Spacer(Modifier.height(4.dp))
+        Text(
+            text = autostartStatus,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Spacer(Modifier.height(8.dp))
+        OutlinedButton(onClick = { openAutostartSettings(context) }) {
+            Text(stringResource(R.string.settings_autostart_open))
+        }
+        Spacer(Modifier.height(4.dp))
+        OutlinedButton(onClick = { openVpnSettings(context) }) {
+            Text(stringResource(R.string.settings_always_on_vpn))
+        }
+
+        Spacer(Modifier.height(20.dp))
+        SectionTitle(stringResource(R.string.settings_section_excluded))
+        Text(
+            text = stringResource(R.string.settings_excluded_hint),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Spacer(Modifier.height(4.dp))
+        if (excluded.isEmpty()) {
+            Text(
+                text = stringResource(R.string.settings_excluded_empty),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        } else {
+            excluded.sortedBy { BlockStats.displayName(context, it).lowercase() }.forEach { pkg ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .padding(end = 8.dp)
+                    ) {
+                        Text(
+                            text = BlockStats.displayName(context, pkg),
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                        Text(
+                            text = pkg,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    TextButton(
+                        onClick = {
+                            PerAppSettings.setTrackerBlockingEnabled(pkg, true)
+                            excluded = PerAppSettings.disabledTrackerPackages()
+                            onExclusionsChanged()
+                        }
+                    ) {
+                        Text(stringResource(R.string.settings_excluded_restore))
+                    }
+                }
+            }
+        }
 
         Spacer(Modifier.height(20.dp))
         SectionTitle(stringResource(R.string.settings_blocklists))
@@ -1311,6 +1678,24 @@ private fun SectionTitle(text: String) {
         style = MaterialTheme.typography.titleMedium,
         modifier = Modifier.padding(bottom = 8.dp)
     )
+}
+
+@Composable
+private fun SettingsRadioRow(text: String, selected: Boolean, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        RadioButton(selected = selected, onClick = onClick)
+        Text(
+            text = text,
+            style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier.padding(start = 4.dp)
+        )
+    }
 }
 
 @Composable

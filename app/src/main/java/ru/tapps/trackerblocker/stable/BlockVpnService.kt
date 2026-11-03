@@ -8,9 +8,14 @@ import android.app.usage.NetworkStats
 import android.app.usage.NetworkStatsManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.graphics.drawable.Icon
 import android.net.ConnectivityManager
+import android.net.LinkProperties
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Build
 import android.os.Handler
@@ -23,8 +28,6 @@ import android.system.OsConstants
 import android.util.Log
 import java.io.File
 import java.io.IOException
-import java.net.DatagramPacket
-import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.text.SimpleDateFormat
@@ -64,15 +67,86 @@ class BlockVpnService : VpnService() {
 
     private val writeLock = Any()
 
+    /** Набор пакетов, исключённых из VPN на момент последнего establish(). */
+    @Volatile
+    private var appliedExcludedPackages: Set<String> = emptySet()
+
     /** Обновление уведомления после окончания паузы. */
     private val notifyHandler = Handler(Looper.getMainLooper())
     private val pauseEndRunnable = Runnable { if (running) showNotification() }
+
+    /**
+     * Плановая проверка блоклистов, пока VPN работает: без неё списки
+     * обновлялись только при входе в приложение и старте сервиса, а при
+     * длительной работе (сутки и больше) успевали устареть.
+     */
+    private val blocklistCheckRunnable: Runnable = Runnable {
+        if (!running) return@Runnable
+        Thread {
+            BlocklistRepository.refreshIfStale(applicationContext)
+            Log.d(TAG, "Плановая проверка блоклистов завершена")
+        }.apply {
+            name = "AntiTrack-BlocklistPeriodic"
+            isDaemon = true
+        }.start()
+        notifyHandler.postDelayed(blocklistCheckRunnable, BLOCKLIST_CHECK_INTERVAL_MS)
+    }
 
     @Volatile
     private var relayPool: java.util.concurrent.ExecutorService? = null
 
     private class DnsCacheEntry(val response: ByteArray, val expiresAt: Long)
     private val dnsCache = ConcurrentHashMap<String, DnsCacheEntry>()
+
+    /**
+     * DNS-серверы текущей сети для режима «Системный». Обновляются при смене
+     * Wi-Fi/мобильной сети, иначе после переключения запросы уходили бы на
+     * старый, уже недоступный резолвер.
+     */
+    @Volatile
+    private var systemDnsServers: List<String> = emptyList()
+
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
+
+    /** Транспорт до upstream: UDP и DoT, с переиспользованием TLS-соединения. */
+    @Volatile
+    private var dnsUpstream: DnsUpstream? = null
+
+    @Volatile
+    private var appliedDnsProviderId: String? = null
+
+    /** Последний ответивший UDP-сервер: пробуем его первым. */
+    @Volatile
+    private var lastGoodDns: Pair<String, String>? = null
+
+    // — возврат защиты после другого VPN —
+
+    /**
+     * Наш VPN отозван не пользователем, а другим VPN-приложением. Сервис
+     * остаётся в foreground и ждёт, пока чужой VPN выключится, чтобы поднять
+     * блокировку снова. Ручная остановка (ACTION_STOP) этот флаг сбрасывает.
+     */
+    @Volatile
+    private var awaitingOtherVpn = false
+
+    /** Чужой VPN уже наблюдался: не перехватываем его раньше времени. */
+    private var sawOtherVpn = false
+
+    /** С какого момента чужого VPN не видно; 0 — виден или ещё не проверяли. */
+    private var noVpnSinceMs = 0L
+
+    private var resumeAttempts = 0
+
+    private var resumeVpnWatcher: ConnectivityManager.NetworkCallback? = null
+    private var resumeDefaultWatcher: ConnectivityManager.NetworkCallback? = null
+
+    private val resumePollRunnable = object : Runnable {
+        override fun run() {
+            if (!awaitingOtherVpn) return
+            checkOtherVpnState()
+            if (awaitingOtherVpn) notifyHandler.postDelayed(this, RESUME_POLL_MS)
+        }
+    }
 
     @Volatile
     private var running = false
@@ -125,6 +199,9 @@ class BlockVpnService : VpnService() {
 
     private val lifecycleLock = Any()
 
+    /** Сервис запущен после перезагрузки — результат пишем в диагностику. */
+    private var autostartRequested = false
+
     companion object {
         private const val TAG = "BlockVpnService"
         private const val CHANNEL_ID = "antitrack_vpn"
@@ -132,6 +209,7 @@ class BlockVpnService : VpnService() {
         private const val REQUEST_PAUSE = 10
         private const val REQUEST_RESUME = 11
         private const val REQUEST_STOP = 12
+        private const val REQUEST_RESUME_NOW = 13
 
         /** Окно, в течение которого приложение считается «активно передававшим». */
         private const val ACTIVE_APP_WINDOW_MS = 30_000L
@@ -162,6 +240,20 @@ class BlockVpnService : VpnService() {
         const val ACTION_RESUME = "ru.tapps.trackerblocker.stable.action.RESUME"
         const val ACTION_REFRESH = "ru.tapps.trackerblocker.stable.action.REFRESH"
 
+        /** Немедленно вернуть защиту, даже если сейчас работает другой VPN. */
+        const val ACTION_RESUME_NOW = "ru.tapps.trackerblocker.stable.action.RESUME_NOW"
+
+        /**
+         * Сервис жив, но VPN сейчас принадлежит другому приложению.
+         * MainActivity показывает по этому флагу отдельный статус.
+         */
+        @Volatile
+        var isWaitingForOtherVpn = false
+            private set
+
+        /** true, если сервис поднят [BootReceiver] — для диагностики автозапуска. */
+        const val EXTRA_AUTOSTART = "ru.tapps.trackerblocker.stable.extra.AUTOSTART"
+
         /** Длительность паузы из уведомления. */
         private const val PAUSE_DURATION_MS = 15 * 60 * 1000L
 
@@ -170,20 +262,44 @@ class BlockVpnService : VpnService() {
         private const val DNS_IP = "10.88.88.53"
         private const val DNS_ROUTE_PREFIX = 32
 
-        // Резолверы для пересылки разрешённых запросов. Первый рабочий в РФ — Яндекс.DNS.
-        val upstreamDnsServers: List<String> = listOf(
-            "77.88.8.8",           // Yandex.DNS
-            "77.88.8.1",           // Yandex.DNS (backup)
-            "208.67.222.222",      // OpenDNS
-            "208.67.220.220"       // OpenDNS (backup)
-        )
+        /**
+         * IPv6-адрес туннеля и виртуального DNS (ULA). Нужен, чтобы запросы,
+         * ушедшие на IPv6-резолвер системы, тоже попадали в фильтр: маршрут
+         * /128 забирает в туннель только адрес нашего DNS, остальной IPv6
+         * по-прежнему идёт напрямую.
+         */
+        private const val TUN_IP6 = "fd00:1:fd00:1::1"
+        private const val TUN_PREFIX6 = 128
+        private const val DNS_IP6 = "fd00:1:fd00:1::53"
+        private const val DNS_ROUTE_PREFIX6 = 128
+
+        // Запасной резолвер, если системный DNS недоступен или не определился.
+        private const val FALLBACK_DNS_IPV4 = "77.88.8.8"
 
         private const val DNS_PORT = 53
-        private const val MTU = 1500
-        private const val DNS_TIMEOUT_MS = 5000
+        /**
+         * MTU туннеля. Через него ходят только DNS-пакеты, поэтому запас
+         * больше 1500 безопасен и нужен для ответов DoT, которые не всегда
+         * укладываются в классический лимит UDP.
+         */
+        private const val MTU = 4096
+        private const val DNS_TIMEOUT_MS = 2000
+        private const val DNS_DOT_TIMEOUT_MS = 4000
+        /** TTL кеша, когда в ответе нет записей или его не удалось разобрать. */
         private const val DNS_CACHE_TTL_MS = 120_000L
-        private const val DNS_MAX_RESPONSE = 2048
+        private const val DNS_CACHE_MIN_TTL_MS = 30_000L
+        private const val DNS_CACHE_MAX_TTL_MS = 60 * 60 * 1000L
+        private const val DNS_MAX_RESPONSE = 4096
         private const val DNS_CACHE_MAX_SIZE = 2048
+        /**
+         * Максимальный размер EDNS0-ответа. 1232 байта — безопасный размер
+         * для любой сети; ответы больше прежнего лимита теперь не теряются
+         * молча, а заодно не провоцируют фрагментацию.
+         */
+        private const val EDNS_MAX_PAYLOAD = 1232
+
+        private const val TYPE_A = 1
+        private const val TYPE_AAAA = 28
 
         /**
          * Известные серверы зашифрованного/альтернативного DNS (DoH/DoT и
@@ -208,8 +324,57 @@ class BlockVpnService : VpnService() {
             "64.6.64.6",          // Neustar
             "64.6.65.6",          // Neustar
             "84.200.69.80",       // DNS.WATCH
-            "84.200.70.40"        // DNS.WATCH
+            "84.200.70.40",       // DNS.WATCH
+            "76.76.2.0",          // ControlD
+            "76.76.10.0",         // ControlD
+            "194.242.2.2",        // Mullvad
+            "193.110.81.0",       // DNS0.eu
+            "185.253.5.0",        // DNS0.eu
+            "185.228.168.9",      // CleanBrowsing
+            "185.228.169.9",      // CleanBrowsing
+            "45.90.28.0",         // NextDNS
+            "45.90.30.0"          // NextDNS
         )
+
+        /** Те же резолверы по IPv6 — иначе DoH/DoT по IPv6 обходил бы туннель. */
+        private val bypassDnsIps6 = listOf(
+            "2606:4700:4700::1111",   // Cloudflare
+            "2606:4700:4700::1001",   // Cloudflare
+            "2001:4860:4860::8888",   // Google
+            "2001:4860:4860::8844",   // Google
+            "2620:fe::fe",            // Quad9
+            "2620:fe::9",             // Quad9
+            "2620:119:35::35",        // OpenDNS
+            "2620:119:53::53",        // OpenDNS
+            "2a00:5a60::ad1:0ff",     // AdGuard DNS
+            "2a00:5a60::ad2:0ff",     // AdGuard DNS
+            "2a02:6b8::feed:0ff",     // Yandex.DNS
+            "2a02:6b8:0:1::feed:0ff", // Yandex.DNS (backup)
+            "2606:1a40::",            // ControlD
+            "2606:1a40:1::",          // ControlD
+            "2a07:e340::2",           // Mullvad
+            "2a0f:fc80::",            // DNS0.eu
+            "2a0f:fc81::",            // DNS0.eu
+            "2a0d:2a00:1::2",         // CleanBrowsing
+            "2a0d:2a00:2::2",         // CleanBrowsing
+            "2a07:a8c0::",            // NextDNS
+            "2a07:a8c1::"             // NextDNS
+        )
+
+        /**
+         * Как часто сервис проверяет, не устарели ли блоклисты. Сама проверка
+         * дешёвая: [BlocklistRepository.refreshIfStale] скачивает списки только
+         * если кеш старше 6 часов.
+         */
+        private const val BLOCKLIST_CHECK_INTERVAL_MS = 60 * 60 * 1000L
+
+        /** Как часто перепроверяем, не отключился ли чужой VPN. */
+        private const val RESUME_POLL_MS = 5_000L
+        /** Пауза «чужого VPN не видно»: даём ему время подняться. */
+        private const val RESUME_GRACE_MS = 6_000L
+        /** Задержка перед повторной попыткой, если establish() не удался. */
+        private const val RESUME_RETRY_MS = 15_000L
+        private const val RESUME_MAX_ATTEMPTS = 5
 
         @Volatile
         var isRunning = false
@@ -217,7 +382,10 @@ class BlockVpnService : VpnService() {
 
         val blockedCount = AtomicLong(0)
 
-        /** Пакеты, чей трафик полностью освобождён от блокировки трекеров. */
+        /**
+         * Пакеты, которые всегда исключены из VPN: само приложение и браузер
+         * Mangum со встроенной блокировкой. Их трафик не попадает в туннель.
+         */
         private val exemptPackages = setOf(
             "ru.tapps.trackerblocker.stable",
             "ru.tapps.mangum.android"
@@ -253,6 +421,9 @@ class BlockVpnService : VpnService() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
         Log.i(TAG, "onStartCommand: running=$running startId=$startId action=${intent?.action ?: "null"}")
+        if (intent?.getBooleanExtra(EXTRA_AUTOSTART, false) == true) {
+            autostartRequested = true
+        }
         when (intent?.action) {
             ACTION_STOP -> {
                 // Платформа держит binding к VpnService, поэтому stopService() не может
@@ -260,6 +431,10 @@ class BlockVpnService : VpnService() {
                 // разорвёт VPN, отпустит binding и вызовет onDestroy.
                 Log.i(TAG, "Команда отключения")
                 AppSettings.clearPause()
+                // Пользователь выключил защиту вручную — после перезагрузки
+                // она не должна включаться сама.
+                AppSettings.setProtectionEnabled(false)
+                stopWaitingForOtherVpn()
                 notifyHandler.removeCallbacks(pauseEndRunnable)
                 teardown()
                 stopSelf()
@@ -277,12 +452,35 @@ class BlockVpnService : VpnService() {
                 showNotification()
                 return START_STICKY
             }
+            ACTION_RESUME_NOW -> {
+                Log.i(TAG, "Возврат защиты по команде пользователя")
+                stopWaitingForOtherVpn()
+                showNotification()
+                startVpn()
+                return START_STICKY
+            }
             ACTION_REFRESH -> {
-                // Настройки блокировки изменились — обновляем текст уведомления.
+                // Настройки изменились. Если состав исключённых приложений другой,
+                // пересоздаём туннель: addDisallowedApplication применяется только
+                // в момент establish().
+                if (running && excludedPackages() != appliedExcludedPackages) {
+                    Log.i(TAG, "Состав исключённых приложений изменился — пересоздаю туннель")
+                    teardown()
+                    startVpn()
+                }
                 showNotification()
                 return START_STICKY
             }
         }
+        // Система перезапустила сервис (intent == null) уже после того, как
+        // слот VPN заняло другое приложение: не отбираем его, а ждём.
+        if (intent == null && isOtherVpnActive()) {
+            beginWaitingForOtherVpn()
+            return START_STICKY
+        }
+        // Обычный запуск (в том числе из MainActivity) отменяет ожидание:
+        // пользователь сам решил вернуть защиту.
+        if (awaitingOtherVpn) stopWaitingForOtherVpn()
         // startForeground до establish(): если create вернёт null, сервис можно
         // остановить без ForegroundServiceDidNotStartInTimeException.
         showNotification()
@@ -292,6 +490,7 @@ class BlockVpnService : VpnService() {
 
     override fun onDestroy() {
         Log.i(TAG, "onDestroy")
+        stopWaitingForOtherVpn()
         notifyHandler.removeCallbacks(pauseEndRunnable)
         BlockStats.flush()
         teardown()
@@ -299,32 +498,55 @@ class BlockVpnService : VpnService() {
     }
 
     override fun onRevoke() {
-        Log.w(TAG, "onRevoke: согласие на VPN отозвано системой")
+        Log.w(TAG, "onRevoke: VPN отозван системой")
+        // onRevoke приходит в двух случаях:
+        //  - другое приложение подняло свой VPN и забрало единственный слот
+        //    (согласие на наш VPN при этом сохраняется);
+        //  - пользователь сам отозвал согласие, выключив VPN.
+        // В первом случае ждём освобождения слота и включаемся снова, во
+        // втором VpnService.prepare() вернёт Intent, и ожидание сразу завершится.
+        val shouldResume = AppSettings.isProtectionEnabled()
         teardown()
-        super.onRevoke()
+        if (shouldResume) {
+            // Не вызываем super: его реализация делает stopSelf(), а сервис
+            // должен остаться жив, чтобы вернуть защиту после чужого VPN.
+            notifyHandler.post { beginWaitingForOtherVpn() }
+        } else {
+            super.onRevoke()
+        }
     }
 
     // ————————————————————— включение/выключение —————————————————————
 
-    private fun startVpn() {
+    private fun startVpn(keepAliveOnFailure: Boolean = false): Boolean =
         synchronized(lifecycleLock) {
             if (running) {
                 Log.i(TAG, "startVpn пропущен: уже работает")
-                return
+                return@synchronized true
             }
             val tun = buildTunnel()
             if (tun == null) {
                 Log.e(TAG, "Не удалось создать туннель (нет согласия на VPN?)")
-                stopSelf()
-                return
+                if (autostartRequested) {
+                    AppSettings.setAutostartResult(AppSettings.AUTOSTART_ERROR)
+                    autostartRequested = false
+                }
+                if (!keepAliveOnFailure) stopSelf()
+                return@synchronized false
             }
             tunnel = tun
             tunnelWriter = tun.fileDescriptor
             running = true
             isRunning = true
+            if (autostartRequested) {
+                AppSettings.setAutostartResult(AppSettings.AUTOSTART_STARTED)
+                autostartRequested = false
+            }
             blockedCount.set(0)
             dnsCache.clear()
             rebuildUidCache()
+            refreshSystemDns()
+            startNetworkMonitor()
             relayPool = Executors.newFixedThreadPool(8)
             if (ATTRIBUTION_DIAGNOSTICS) {
                 diagnosticsPool = Executors.newSingleThreadExecutor()
@@ -340,6 +562,10 @@ class BlockVpnService : VpnService() {
                 isDaemon = true
             }.start()
 
+            // и дальше проверяем его раз в час, пока сервис работает
+            notifyHandler.removeCallbacks(blocklistCheckRunnable)
+            notifyHandler.postDelayed(blocklistCheckRunnable, BLOCKLIST_CHECK_INTERVAL_MS)
+
             // свежий поток на каждый запуск, чтобы повторный старт не упал
             // с IllegalThreadStateException
             Thread(::tunnelLoop).apply {
@@ -351,8 +577,9 @@ class BlockVpnService : VpnService() {
                 name = "AntiTrack-TrafficWatcher"
                 isDaemon = true
             }.start()
+
+            true
         }
-    }
 
     private fun buildTunnel(): ParcelFileDescriptor? {
         val configureIntent = PendingIntent.getActivity(
@@ -366,11 +593,35 @@ class BlockVpnService : VpnService() {
             .addAddress(TUN_IP, TUN_PREFIX)
             .addRoute(DNS_IP, DNS_ROUTE_PREFIX)
             .addDnsServer(DNS_IP)
+            .addAddress(TUN_IP6, TUN_PREFIX6)
+            .addRoute(DNS_IP6, DNS_ROUTE_PREFIX6)
+            .addDnsServer(DNS_IP6)
         // DoH/DoT не должен обходить фильтр: TCP и UDP к этим адресам уводятся
         // в туннель, TCP там гаснет, а UDP:53 проходит наш DNS-фильтр.
         for (ip in bypassDnsIps) builder.addRoute(ip, 32)
+        for (ip in bypassDnsIps6) builder.addRoute(ip, 128)
+
+        // Исключённые приложения выпускаем из VPN целиком. Свой пакет исключить
+        // нельзя, поэтому для него остаётся только логическая проверка в handlePacket.
+        val excluded = excludedPackages()
+        for (pkg in excluded) {
+            if (pkg == packageName) continue
+            try {
+                builder.addDisallowedApplication(pkg)
+            } catch (e: PackageManager.NameNotFoundException) {
+                Log.w(TAG, "Исключённое приложение не установлено: $pkg")
+            } catch (e: UnsupportedOperationException) {
+                Log.w(TAG, "Пакет нельзя исключить из VPN: $pkg", e)
+            }
+        }
+        appliedExcludedPackages = excluded
+
         return builder.establish()
     }
+
+    /** Приложения, которые не должны проходить через VPN. */
+    private fun excludedPackages(): Set<String> =
+        exemptPackages + PerAppSettings.disabledTrackerPackages()
 
     private fun teardown() {
         synchronized(lifecycleLock) {
@@ -381,6 +632,19 @@ class BlockVpnService : VpnService() {
             Log.i(TAG, "Остановка VPN (running=$running)")
             running = false
             isRunning = false
+            notifyHandler.removeCallbacks(blocklistCheckRunnable)
+            stopNetworkMonitor()
+            // Закрытие DoT-соединения берёт блокировку и может ждать
+            // незавершённый запрос, поэтому не делаем это на main thread.
+            val oldUpstream = dnsUpstream
+            dnsUpstream = null
+            if (oldUpstream != null) {
+                Thread({ oldUpstream.close() }, "AntiTrack-DnsClose").apply {
+                    isDaemon = true
+                }.start()
+            }
+            appliedDnsProviderId = null
+            lastGoodDns = null
             relayPool?.shutdownNow()
             relayPool = null
             diagnosticsPool?.shutdownNow()
@@ -395,6 +659,338 @@ class BlockVpnService : VpnService() {
             tunnelWriter = null
             Log.i(TAG, "VPN остановлен")
         }
+    }
+
+    // ————————————————————— возврат после другого VPN —————————————————————
+
+    /**
+     * Держит сервис в ожидании, пока другое VPN-приложение освободит слот.
+     * Мы не можем «жить» одновременно с ним: Android разрешает только один
+     * активный VPN. Зато согласие на наш VPN при этом сохраняется, поэтому
+     * после отключения чужого можно снова вызвать establish().
+     */
+    private fun beginWaitingForOtherVpn() {
+        if (awaitingOtherVpn) return
+        awaitingOtherVpn = true
+        isWaitingForOtherVpn = true
+        resumeAttempts = 0
+        sawOtherVpn = isOtherVpnActive()
+        noVpnSinceMs = if (sawOtherVpn) 0L else System.currentTimeMillis()
+        Log.i(TAG, "Другой VPN активен — защита вернётся после его отключения")
+        registerResumeWatcher()
+        showNotification()
+        notifyHandler.removeCallbacks(resumePollRunnable)
+        notifyHandler.postDelayed(resumePollRunnable, RESUME_POLL_MS)
+        // Проверяем сразу: если согласие отозвано, ждать бессмысленно.
+        checkOtherVpnState()
+    }
+
+    /**
+     * Одна проверка состояния. Вызывается по таймеру и по событиям сети.
+     * Возврат защиты делаем только когда чужого VPN нет достаточно долго,
+     * иначе можно перехватить его в момент запуска.
+     */
+    private fun checkOtherVpnState() {
+        if (!awaitingOtherVpn) return
+        if (!AppSettings.isProtectionEnabled() ||
+            (!AppSettings.blockTrackers() && !AppSettings.blockAds())
+        ) {
+            stopWaitingForOtherVpn()
+            stopSelf()
+            return
+        }
+
+        val now = System.currentTimeMillis()
+        if (isOtherVpnActive()) {
+            // Чужой VPN на месте — ничего не делаем. prepare() в этот момент
+            // не вызываем, чтобы не вмешиваться в его работу.
+            sawOtherVpn = true
+            noVpnSinceMs = 0L
+            return
+        }
+
+        // Пользователь отозвал согласие (выключил VPN в системных настройках).
+        // Без нового диалога согласия включиться нельзя — прекращаем ожидание.
+        if (VpnService.prepare(this) != null) {
+            Log.i(TAG, "Согласие на VPN отозвано — автоматический возврат отменён")
+            AppSettings.setProtectionEnabled(false)
+            AppSettings.setAutostartResult(AppSettings.AUTOSTART_NO_CONSENT)
+            stopWaitingForOtherVpn()
+            stopSelf()
+            return
+        }
+
+        if (noVpnSinceMs == 0L) {
+            noVpnSinceMs = now
+            return
+        }
+        // Если чужой VPN так и не появился (например, приложение упало при
+        // запуске), даём ему больше времени, чтобы не отобрать слот раньше.
+        val grace = if (sawOtherVpn) RESUME_GRACE_MS else RESUME_GRACE_MS * 2
+        if (now - noVpnSinceMs < grace) return
+        resumeProtection()
+    }
+
+    /** Поднимает туннель заново; при неудаче возвращает сервис в ожидание. */
+    private fun resumeProtection() {
+        awaitingOtherVpn = false
+        notifyHandler.removeCallbacks(resumePollRunnable)
+        unregisterResumeWatcher()
+        Log.i(TAG, "Другой VPN отключён — возвращаю защиту")
+        Thread {
+            val started = startVpn(keepAliveOnFailure = true)
+            notifyHandler.post {
+                when {
+                    started -> {
+                        resumeAttempts = 0
+                        isWaitingForOtherVpn = false
+                        showNotification()
+                    }
+                    !AppSettings.isProtectionEnabled() -> stopSelf()
+                    resumeAttempts + 1 >= RESUME_MAX_ATTEMPTS -> {
+                        Log.w(TAG, "Не удалось вернуть защиту после другого VPN")
+                        isWaitingForOtherVpn = false
+                        stopSelf()
+                    }
+                    else -> {
+                        // Слот могли снова занять — продолжаем ждать.
+                        resumeAttempts++
+                        awaitingOtherVpn = true
+                        isWaitingForOtherVpn = true
+                        sawOtherVpn = isOtherVpnActive()
+                        noVpnSinceMs = System.currentTimeMillis()
+                        registerResumeWatcher()
+                        showNotification()
+                        notifyHandler.postDelayed(resumePollRunnable, RESUME_RETRY_MS)
+                    }
+                }
+            }
+        }.apply {
+            name = "AntiTrack-Resume"
+            isDaemon = true
+        }.start()
+    }
+
+    /** true, если сейчас активен VPN — наш собственный уже закрыт. */
+    private fun isOtherVpnActive(): Boolean {
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return false
+        val active = cm.activeNetwork
+        if (active != null && cm.getNetworkCapabilities(active)
+                ?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
+        ) {
+            return true
+        }
+        return try {
+            // VPN другого приложения иногда виден только в общем списке сетей.
+            cm.allNetworks.any { network ->
+                cm.getNetworkCapabilities(network)
+                    ?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Не удалось перечислить сети при ожидании VPN", e)
+            false
+        }
+    }
+
+    /** Подписка на появление/исчезновение VPN и смену обычной сети. */
+    private fun registerResumeWatcher() {
+        if (resumeVpnWatcher != null || resumeDefaultWatcher != null) return
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return
+
+        val vpnCallback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                notifyHandler.post { checkOtherVpnState() }
+            }
+
+            override fun onLost(network: Network) {
+                notifyHandler.post { checkOtherVpnState() }
+            }
+
+            override fun onCapabilitiesChanged(
+                network: Network,
+                networkCapabilities: NetworkCapabilities
+            ) {
+                notifyHandler.post { checkOtherVpnState() }
+            }
+        }
+        try {
+            val request = NetworkRequest.Builder()
+                .addTransportType(NetworkCapabilities.TRANSPORT_VPN)
+                .apply {
+                    // API 31+: видеть VPN-сети, которые не применяются к нам
+                    // (чужой VPN с раздельным туннелированием).
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        setIncludeOtherUidNetworks(true)
+                    }
+                }
+                .build()
+            cm.registerNetworkCallback(request, vpnCallback)
+            resumeVpnWatcher = vpnCallback
+        } catch (e: Exception) {
+            Log.w(TAG, "Не удалось подписаться на VPN-сети", e)
+        }
+
+        val defaultCallback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                notifyHandler.post { checkOtherVpnState() }
+            }
+
+            override fun onLost(network: Network) {
+                notifyHandler.post { checkOtherVpnState() }
+            }
+        }
+        try {
+            cm.registerDefaultNetworkCallback(defaultCallback)
+            resumeDefaultWatcher = defaultCallback
+        } catch (e: Exception) {
+            Log.w(TAG, "Не удалось подписаться на смену сети", e)
+        }
+    }
+
+    private fun unregisterResumeWatcher() {
+        val cm = getSystemService(ConnectivityManager::class.java)
+        resumeVpnWatcher?.let { runCatching { cm?.unregisterNetworkCallback(it) } }
+        resumeVpnWatcher = null
+        resumeDefaultWatcher?.let { runCatching { cm?.unregisterNetworkCallback(it) } }
+        resumeDefaultWatcher = null
+    }
+
+    private fun stopWaitingForOtherVpn() {
+        awaitingOtherVpn = false
+        isWaitingForOtherVpn = false
+        notifyHandler.removeCallbacks(resumePollRunnable)
+        unregisterResumeWatcher()
+    }
+
+    // ————————————————————— системный DNS и upstream —————————————————————
+
+    /**
+     * Собирает DNS-серверы физической сети. `getUnderlyingNetworks()` в
+     * публичном API VpnService нет, поэтому берём все не-VPN сети с доступом
+     * в интернет. Адреса собственного виртуального DNS отфильтровываются,
+     * чтобы не получить петлю «запрос самому себе».
+     */
+    private fun refreshSystemDns() {
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return
+        val result = LinkedHashSet<String>()
+
+        fun collect(network: Network?, validatedOnly: Boolean) {
+            if (network == null) return
+            val caps = try {
+                cm.getNetworkCapabilities(network)
+            } catch (e: Exception) {
+                null
+            }
+            if (caps == null ||
+                caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) ||
+                !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) ||
+                (validatedOnly && !caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED))
+            ) {
+                return
+            }
+            val linkProperties = try {
+                cm.getLinkProperties(network)
+            } catch (e: Exception) {
+                Log.w(TAG, "Не удалось получить LinkProperties", e)
+                null
+            } ?: return
+            for (address in linkProperties.dnsServers) {
+                val host = address.hostAddress ?: continue
+                if (host == DNS_IP || host == DNS_IP6) continue
+                result.add(host)
+            }
+        }
+
+        try {
+            val networks = cm.allNetworks
+            // Сначала проверенные сети: при одновременном Wi-Fi и мобильном
+            // интернете это не даст взять DNS неиспользуемой сети.
+            networks.forEach { collect(it, validatedOnly = true) }
+            if (result.isEmpty()) networks.forEach { collect(it, validatedOnly = false) }
+        } catch (e: Exception) {
+            Log.w(TAG, "Не удалось перечислить сети", e)
+        }
+        if (result.isEmpty()) collect(cm.activeNetwork, validatedOnly = false)
+        systemDnsServers = result.toList()
+        Log.d(TAG, "Системные DNS: ${systemDnsServers.ifEmpty { listOf(FALLBACK_DNS_IPV4) }}")
+    }
+
+    private fun startNetworkMonitor() {
+        if (networkCallback != null) return
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) = refreshSystemDns()
+            override fun onLost(network: Network) = refreshSystemDns()
+            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) =
+                refreshSystemDns()
+        }
+        try {
+            // Слушаем все интернет-сети, а не только default: при активном VPN
+            // default — это наш туннель, и смена Wi-Fi может не дать события.
+            val request = NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .build()
+            cm.registerNetworkCallback(request, callback)
+            networkCallback = callback
+        } catch (e: Exception) {
+            Log.w(TAG, "Не удалось подписаться на смену сети", e)
+        }
+    }
+
+    private fun stopNetworkMonitor() {
+        val callback = networkCallback ?: return
+        networkCallback = null
+        try {
+            getSystemService(ConnectivityManager::class.java)?.unregisterNetworkCallback(callback)
+        } catch (e: Exception) {
+            Log.w(TAG, "Не удалось отписаться от смены сети", e)
+        }
+    }
+
+    private fun upstream(): DnsUpstream {
+        dnsUpstream?.let { return it }
+        synchronized(this) {
+            dnsUpstream?.let { return it }
+            return DnsUpstream(
+                protectDatagram = { socket -> protect(socket) },
+                protectSocket = { socket -> protect(socket) }
+            ).also { dnsUpstream = it }
+        }
+    }
+
+    /**
+     * Список UDP-серверов для выбранного режима. Для «Системного» сначала идут
+     * DNS текущей сети, затем запасной резолвер; для остальных — адреса
+     * провайдера. Пользовательские адреса проверяются на корректность.
+     */
+    private fun upstreamServers(provider: DnsProvider): List<String> {
+        val servers = when {
+            provider.id == DnsProviders.SYSTEM_ID ->
+                systemDnsServers.take(2) + FALLBACK_DNS_IPV4
+            provider.custom ->
+                AppSettings.customDnsServers()
+            else ->
+                provider.ipv4 + provider.ipv6
+        }
+        val validated = servers.filter { isNumericAddress(it) }.distinct()
+        return if (validated.isEmpty() && provider.id == DnsProviders.CUSTOM_ID) {
+            systemDnsServers.take(2) + FALLBACK_DNS_IPV4
+        } else {
+            // Больше четырёх попыток на один запрос — это уже несколько секунд
+            // ожидания при недоступной сети; клиент всё равно повторит запрос.
+            validated.take(4)
+        }
+    }
+
+    /** Проверка, что строка — числовой IP, а не имя (иначе получим DNS-петлю). */
+    private fun isNumericAddress(value: String): Boolean {
+        val host = value.substringBefore('%')
+        if (host.isEmpty()) return false
+        val isIpv4 = host.matches(Regex("""\d{1,3}(\.\d{1,3}){3}""")) &&
+            host.split('.').all { part -> part.toIntOrNull()?.let { it in 0..255 } == true }
+        val isIpv6 = host.contains(':') && host.matches(Regex("""[0-9a-fA-F:]+""")) &&
+            runCatching { InetAddress.getByName(host) }.getOrNull() != null
+        return isIpv4 || isIpv6
     }
 
     // ————————————————————— цикл обработки пакетов —————————————————————
@@ -424,30 +1020,221 @@ class BlockVpnService : VpnService() {
                 break
             }
         }
+        // Чтение завершилось не по нашей команде (например, система отдала VPN
+        // другому приложению): ждём его отключения и возвращаем защиту.
+        if (running) handleTunnelLoss()
+    }
+
+    /**
+     * Туннель закрылся сам, хотя сервис не останавливали. Это происходит,
+     * когда слот VPN забирает другое приложение. Действуем так же, как в
+     * [onRevoke], — на случай, если система не прислала onRevoke.
+     */
+    private fun handleTunnelLoss() {
+        if (!running) return
+        val shouldResume = AppSettings.isProtectionEnabled()
+        Log.w(TAG, "Туннель закрыт системой")
+        teardown()
+        if (shouldResume) {
+            notifyHandler.post { beginWaitingForOtherVpn() }
+        } else {
+            stopSelf()
+        }
     }
 
     private fun handlePacket(packet: ByteArray, len: Int) {
+        val version = (packet[0].toInt() and 0xFF) shr 4
+        when (version) {
+            4 -> handleIpv4Packet(packet, len)
+            6 -> handleIpv6Packet(packet, len)
+        }
+    }
+
+    /** Разбор IPv4+UDP: в туннель попадают только DNS-пакеты (порт 53). */
+    private fun handleIpv4Packet(packet: ByteArray, len: Int) {
         val vhl = packet[0].toInt() and 0xFF
-        if (vhl shr 4 != 4) return // только IPv4
         val ihl = (vhl and 0x0F) * 4
         if (ihl < 20 || len < ihl + 20) return
         val protocol = packet[9].toInt() and 0xFF
-        if (protocol != 17) return // в туннель попадают только UDP DNS-пакеты
+        if (protocol == 6) {
+            handleIpv4Tcp(packet, len, ihl)
+            return
+        }
+        if (protocol != 17) return // в туннель попадают только DNS-пакеты
         val srcIp = packet.copyOfRange(12, 16)
         val dstIp = packet.copyOfRange(16, 20)
         val srcPort = read16(packet, ihl)
         val dstPort = read16(packet, ihl + 2)
         if (dstPort != DNS_PORT) return
+        handleDnsPacket(packet, ihl + 8, len, srcIp, dstIp, srcPort)
+    }
 
-        val dnsStart = ihl + 8
+    /**
+     * Разбор IPv6+UDP. Расширения заголовка (фрагментация, хоп-бай-хоп)
+     * не поддерживаются: DNS-запросы уходят без них, а всё остальное
+     * в туннель не маршрутизируется.
+     */
+    private fun handleIpv6Packet(packet: ByteArray, len: Int) {
+        if (len < 48) return // 40 байт IPv6 + 8 байт UDP
+        val nextHeader = packet[6].toInt() and 0xFF
+        if (nextHeader == 6) {
+            handleIpv6Tcp(packet, len)
+            return
+        }
+        if (nextHeader != 17) return
+        val srcIp = packet.copyOfRange(8, 24)
+        val dstIp = packet.copyOfRange(24, 40)
+        val srcPort = read16(packet, 40)
+        val dstPort = read16(packet, 42)
+        if (dstPort != DNS_PORT) return
+        handleDnsPacket(packet, 48, len, srcIp, dstIp, srcPort)
+    }
+
+    /**
+     * TCP попадает в туннель только на адрес виртуального DNS: маршрут /32
+     * покрывает все протоколы. Ретрансляция TCP DNS без userspace-стека
+     * невозможна, поэтому сразу отвечаем RST: клиент уходит на другой
+     * резолвер или завершает запрос, а не ждёт таймаут.
+     */
+    private fun handleIpv4Tcp(packet: ByteArray, len: Int, ihl: Int) {
+        if (len < ihl + 20) return
+        val srcIp = packet.copyOfRange(12, 16)
+        val dstIp = packet.copyOfRange(16, 20)
+        val srcPort = read16(packet, ihl)
+        val dstPort = read16(packet, ihl + 2)
+        if (dstPort != DNS_PORT) return
+        val dataOffset = ((packet[ihl + 12].toInt() and 0xF0) shr 4) * 4
+        if (dataOffset < 20 || ihl + dataOffset > len) return
+        val flags = packet[ihl + 13].toInt() and 0xFF
+        val seq = read32(packet, ihl + 4)
+        val ack = read32(packet, ihl + 8)
+        sendTcpReset(srcIp, dstIp, srcPort, seq, ack, flags)
+    }
+
+    private fun handleIpv6Tcp(packet: ByteArray, len: Int) {
+        if (len < 40 + 20) return
+        val srcIp = packet.copyOfRange(8, 24)
+        val dstIp = packet.copyOfRange(24, 40)
+        val srcPort = read16(packet, 40)
+        val dstPort = read16(packet, 42)
+        if (dstPort != DNS_PORT) return
+        val dataOffset = ((packet[52].toInt() and 0xF0) shr 4) * 4
+        if (dataOffset < 20 || 40 + dataOffset > len) return
+        val flags = packet[53].toInt() and 0xFF
+        val seq = read32(packet, 44)
+        val ack = read32(packet, 48)
+        sendTcpReset(srcIp, dstIp, srcPort, seq, ack, flags)
+    }
+
+    /** Собирает RST(+ACK) от виртуального DNS и пишет его в туннель. */
+    private fun sendTcpReset(
+        clientIp: ByteArray,
+        dnsIp: ByteArray,
+        clientPort: Int,
+        incomingSeq: Int,
+        incomingAck: Int,
+        incomingFlags: Int
+    ) {
+        val syn = incomingFlags and 0x02 != 0
+        val seq: Int
+        val ack: Int
+        val flags: Int
+        if (syn) {
+            // Ответ на SYN: подтверждаем его и сбрасываем соединение.
+            seq = 0
+            ack = incomingSeq + 1
+            flags = 0x14 // ACK | RST
+        } else {
+            seq = incomingAck
+            ack = 0
+            flags = 0x04 // RST
+        }
+
+        if (clientIp.size == 16) {
+            val total = 40 + 20
+            val out = ByteArray(total)
+            out[0] = 0x60
+            write16(out, 4, 20)                 // payload length = TCP-заголовок
+            out[6] = 6                          // next header: TCP
+            out[7] = 64
+            System.arraycopy(dnsIp, 0, out, 8, 16)
+            System.arraycopy(clientIp, 0, out, 24, 16)
+            write16(out, 40, DNS_PORT)
+            write16(out, 42, clientPort)
+            write32(out, 44, seq)
+            write32(out, 48, ack)
+            out[52] = 0x50                      // data offset = 5 слов
+            out[53] = flags.toByte()
+            write16(out, 56, transportChecksum(out, 40, 20, ipv6 = true))
+            writeTunnelResponse(out)
+        } else {
+            val total = 20 + 20
+            val out = ByteArray(total)
+            out[0] = 0x45
+            write16(out, 2, total)
+            write16(out, 4, total)
+            out[8] = 64
+            out[9] = 6                          // TCP
+            System.arraycopy(dnsIp, 0, out, 12, 4)
+            System.arraycopy(clientIp, 0, out, 16, 4)
+            write16(out, 20, DNS_PORT)
+            write16(out, 22, clientPort)
+            write32(out, 24, seq)
+            write32(out, 28, ack)
+            out[32] = 0x50
+            out[33] = flags.toByte()
+            write16(out, 34, 0)                 // окно
+            write16(out, 10, ipChecksum(out.copyOfRange(0, 20)))
+            write16(out, 36, transportChecksum(out, 20, 20, ipv6 = false))
+            writeTunnelResponse(out)
+        }
+    }
+
+    /** Контрольная сумма TCP/UDP по псевдозаголовку IPv4/IPv6. */
+    private fun transportChecksum(
+        packet: ByteArray,
+        transportOffset: Int,
+        transportLen: Int,
+        ipv6: Boolean
+    ): Int {
+        val pseudoLen = if (ipv6) 40 else 12
+        val buf = ByteArray(pseudoLen + transportLen)
+        if (ipv6) {
+            System.arraycopy(packet, 8, buf, 0, 32)
+            write32(buf, 32, transportLen)
+            buf[39] = 6
+        } else {
+            System.arraycopy(packet, 12, buf, 0, 8)
+            buf[8] = 0
+            buf[9] = 6
+            write16(buf, 10, transportLen)
+        }
+        System.arraycopy(packet, transportOffset, buf, pseudoLen, transportLen)
+        return ipChecksum(buf)
+    }
+
+    private fun read32(packet: ByteArray, offset: Int): Int =
+        ((packet[offset].toInt() and 0xFF) shl 24) or
+            ((packet[offset + 1].toInt() and 0xFF) shl 16) or
+            ((packet[offset + 2].toInt() and 0xFF) shl 8) or
+            (packet[offset + 3].toInt() and 0xFF)
+
+    private fun handleDnsPacket(
+        packet: ByteArray,
+        dnsStart: Int,
+        len: Int,
+        srcIp: ByteArray,
+        dstIp: ByteArray,
+        srcPort: Int
+    ) {
         if (len < dnsStart + 12) return
-        val qname = DnsParser.readQName(packet, dnsStart + 12) ?: return
+        val qname = DnsParser.readQName(packet, dnsStart + 12, len) ?: return
 
         logAttributionSignals(srcIp, dstIp, srcPort, qname)
 
         val logging = RequestLog.isEnabled
-        val srcIpStr = srcIp.joinToString(".")
-        val dstIpStr = dstIp.joinToString(".")
+        val srcIpStr = ipToString(srcIp)
+        val dstIpStr = ipToString(dstIp)
 
         // Пауза из уведомления: фильтрация временно отключена, запросы идут
         // напрямую к резолверу, но продолжают попадать в лог как разрешённые.
@@ -483,7 +1270,7 @@ class BlockVpnService : VpnService() {
             BlockStats.record(owner, qname, BlockStats.Kind.TRACKER)
             Log.d(TAG, "Заблокировано пользователем: $qname")
             if (logging) RequestLog.record(owner, qname, RequestLog.Status.CUSTOM_BLOCKED, srcIpStr, dstIpStr, qname)
-            buildNxdomainResponse(packet, dnsStart)?.let {
+            buildBlockResponse(packet, dnsStart, len)?.let {
                 writeDnsResponse(srcIp, dstIp, srcPort, it)
             }
             return
@@ -526,7 +1313,7 @@ class BlockVpnService : VpnService() {
                     }
                     // NXDOMAIN вместо «тишины»: клиент завершает запрос сразу, без
                     // таймаута и повторов, которые могли бы «проскочить» мимо фильтра.
-                    buildNxdomainResponse(packet, dnsStart)?.let {
+                    buildBlockResponse(packet, dnsStart, len)?.let {
                         writeDnsResponse(srcIp, dstIp, srcPort, it)
                     }
                     return
@@ -541,7 +1328,7 @@ class BlockVpnService : VpnService() {
             if (isThrottled(owner)) {
                 Log.d(TAG, "Троттлинг: доступ отключён \"$owner\" (запрос $qname)")
                 if (logging) RequestLog.record(owner, qname, RequestLog.Status.THROTTLE, srcIpStr, dstIpStr)
-                buildNxdomainResponse(packet, dnsStart)?.let {
+                buildBlockResponse(packet, dnsStart, len)?.let {
                     writeDnsResponse(srcIp, dstIp, srcPort, it)
                 }
                 return
@@ -870,21 +1657,67 @@ class BlockVpnService : VpnService() {
     }
 
     /**
-     * Собирает DNS-ответ NXDOMAIN по входящему запросу: отдаём клиенту его же
-     * transaction id и копию вопроса, RCODE=3 (имя не существует). Дополнительные
-     * записи (EDNS OPT и т.п.) отбрасываются, чтобы алгоритм не сбоил на хвосте.
+     * Ответ на заблокированный запрос: NXDOMAIN (по умолчанию) или нулевой
+     * адрес, если пользователь выбрал этот режим. Второй вариант помогает
+     * приложениям, которые плохо переносят NXDOMAIN и начинают долбить
+     * резолвер повторами; для AAAA отдаём `::`, для остальных типов — NXDOMAIN.
      */
-    private fun buildNxdomainResponse(packet: ByteArray, dnsStart: Int): ByteArray? {
-        if (dnsStart + 12 > packet.size) return null
+    private fun buildBlockResponse(packet: ByteArray, dnsStart: Int, end: Int): ByteArray? =
+        if (AppSettings.blockWithNullAddress()) {
+            buildNullAddressResponse(packet, dnsStart, end)
+                ?: buildNxdomainResponse(packet, dnsStart, end)
+        } else {
+            buildNxdomainResponse(packet, dnsStart, end)
+        }
+
+    /** DNS-ответ с одним A=0.0.0.0 или AAAA=:: для блокировки. */
+    private fun buildNullAddressResponse(packet: ByteArray, dnsStart: Int, end: Int): ByteArray? {
+        val qEnd = skipQuestion(packet, dnsStart, end) ?: return null
+        val qType = read16(packet, qEnd - 4)
+        if (qType != TYPE_A && qType != TYPE_AAAA) return null
+        val questionLen = qEnd - (dnsStart + 12)
+        val rdataLen = if (qType == TYPE_A) 4 else 16
+        val resp = ByteArray(12 + questionLen + 12 + rdataLen)
+        resp[0] = packet[dnsStart]        // transaction id
+        resp[1] = packet[dnsStart + 1]
+        resp[2] = 0x81.toByte()           // QR=1, RD=1
+        resp[3] = 0x80.toByte()           // RA=1, RCODE=0
+        resp[5] = 1                       // QDCOUNT=1
+        resp[7] = 1                       // ANCOUNT=1
+        System.arraycopy(packet, dnsStart + 12, resp, 12, questionLen)
+        var pos = 12 + questionLen
+        resp[pos] = 0xC0.toByte()         // имя — указатель на вопрос
+        resp[pos + 1] = 0x0C
+        write16(resp, pos + 2, qType)
+        write16(resp, pos + 4, 1)         // класс IN
+        write32(resp, pos + 6, 60)        // TTL 60 с
+        write16(resp, pos + 10, rdataLen)
+        // rdata уже нули: 0.0.0.0 или ::
+        return resp
+    }
+
+    /** Позиция сразу после QNAME+TYPE+CLASS вопроса. */
+    private fun skipQuestion(packet: ByteArray, dnsStart: Int, end: Int): Int? {
+        if (dnsStart + 12 > end) return null
         var i = dnsStart + 12
         while (true) {
-            if (i >= packet.size) return null
+            if (i >= end) return null
             val labelLen = packet[i].toInt() and 0xFF
             if (labelLen == 0) break
             i += 1 + labelLen
         }
-        val qEnd = i + 1 + 4 // нулевой байт qname + TYPE + CLASS
-        if (qEnd > packet.size) return null
+        val qEnd = i + 1 + 4 // нулевой байт QNAME + TYPE + CLASS
+        return if (qEnd <= end) qEnd else null
+    }
+
+    /**
+     * Собирает DNS-ответ NXDOMAIN по входящему запросу: отдаём клиенту его же
+     * transaction id и копию вопроса, RCODE=3 (имя не существует). Дополнительные
+     * записи (EDNS OPT и т.п.) отбрасываются, чтобы алгоритм не сбоил на хвосте.
+     */
+    private fun buildNxdomainResponse(packet: ByteArray, dnsStart: Int, end: Int): ByteArray? {
+        if (dnsStart + 12 > end) return null
+        val qEnd = skipQuestion(packet, dnsStart, end) ?: return null
         val questionLen = qEnd - (dnsStart + 12)
         val resp = ByteArray(12 + questionLen)
         resp[0] = packet[dnsStart]        // transaction id (отвечаем тем же)
@@ -905,60 +1738,193 @@ class BlockVpnService : VpnService() {
         srcPort: Int
     ) {
         val cacheKey = String(dnsPayload, 2, dnsPayload.size - 2, Charsets.ISO_8859_1)
+        val now = System.currentTimeMillis()
         val cached = dnsCache[cacheKey]
-        if (cached != null && System.currentTimeMillis() < cached.expiresAt) {
+        if (cached != null && now < cached.expiresAt) {
+            // Списки обновляются на лету: даже закешированный ответ мог
+            // получить трекерную CNAME-цель. Перепроверяем цепочку.
+            val cachedInfo = DnsParser.parseAnswer(cached.response, cached.response.size)
+            if (tryBlockCname(dnsPayload, srcIp, dstIp, srcPort, cachedInfo)) return
             val response = cached.response.copyOf()
             response[0] = dnsPayload[0]
             response[1] = dnsPayload[1]
             writeDnsResponse(srcIp, dstIp, srcPort, response)
             return
         }
+        if (cached != null) dnsCache.remove(cacheKey, cached)
 
-        var lastError: IOException? = null
-        val startMs = System.currentTimeMillis()
-        for (server in upstreamDnsServers) {
-            if (!running) return
-            val upstream = DatagramSocket()
-            try {
-                protect(upstream)
-                upstream.soTimeout = DNS_TIMEOUT_MS
-                Log.d(TAG, "DNS -> $server (len=${dnsPayload.size})")
-                upstream.send(
-                    DatagramPacket(dnsPayload, dnsPayload.size, InetAddress.getByName(server), DNS_PORT)
-                )
+        val provider = DnsProviders.byId(AppSettings.dnsProviderId())
+        if (provider.id != appliedDnsProviderId) {
+            appliedDnsProviderId = provider.id
+            upstream().resetDot()
+        }
+        val client = upstream()
+        // EDNS0 ограничиваем до 1232 байт: иначе ответ не влезет в MTU туннеля
+        // и будет молча потерян. Заодно вырезаем ECS, чтобы не отдавать
+        // провайдеру подсеть пользователя. Кешируем по исходному запросу.
+        val forwardPayload = DnsParser.sanitizeEdns(
+            dnsPayload,
+            dnsPayload.size,
+            EDNS_MAX_PAYLOAD
+        )
 
-                val buffer = ByteArray(DNS_MAX_RESPONSE)
-                val response = DatagramPacket(buffer, buffer.size)
-                upstream.receive(response)
+        var answer: ByteArray? = null
+        if (AppSettings.dnsEncryptionEnabled() &&
+            provider.dotHost != null &&
+            provider.dotIps.isNotEmpty()
+        ) {
+            answer = client.queryDot(
+                provider.dotHost,
+                provider.dotIps,
+                forwardPayload,
+                DNS_DOT_TIMEOUT_MS
+            )
+        }
+        if (answer == null) {
+            val servers = upstreamServers(provider)
+            val good = lastGoodDns?.takeIf { it.first == provider.id }?.second
+            val ordered = if (good != null && good in servers) {
+                listOf(good) + servers.filter { it != good }
+            } else {
+                servers
+            }
+            for (server in ordered) {
                 if (!running) return
-
-                val answer = response.data.copyOf(response.length)
-                Log.d(TAG, "DNS <- $server len=${answer.size} за ${System.currentTimeMillis() - startMs} мс")
-                if (dnsCache.size >= DNS_CACHE_MAX_SIZE) pruneCache()
-                dnsCache[cacheKey] = DnsCacheEntry(answer, System.currentTimeMillis() + DNS_CACHE_TTL_MS)
-
-                writeDnsResponse(srcIp, dstIp, srcPort, answer)
-                lastError = null
-                break
-            } catch (e: IOException) {
-                lastError = e
-                if (server != upstreamDnsServers.last()) {
-                    Log.w(TAG, "DNS $server недоступен, пробую следующий", e)
+                answer = client.queryUdp(server, forwardPayload, DNS_TIMEOUT_MS)
+                if (answer != null) {
+                    lastGoodDns = provider.id to server
+                    break
                 }
-            } finally {
-                upstream.close()
             }
         }
-        if (lastError != null && running) {
-            Log.w(TAG, "Все DNS-резолверы недоступны", lastError)
+        if (answer == null || !running) {
+            if (running) Log.w(TAG, "Все DNS-резолверы недоступны (${provider.id})")
+            return
         }
+
+        // Отбрасываем ответы с чужим transaction id / вопросом: так кеш и
+        // клиент защищены от подмены и случайных пакетов.
+        if (!DnsParser.isResponseFor(dnsPayload, dnsPayload.size, answer, answer.size)) {
+            Log.w(TAG, "Отброшен DNS-ответ, не соответствующий запросу")
+            return
+        }
+
+        val info = DnsParser.parseAnswer(answer, answer.size)
+        if (tryBlockCname(dnsPayload, srcIp, dstIp, srcPort, info)) return
+
+        val ttlMs = cacheTtlMs(info, answer)
+        if (ttlMs > 0 && answer.size <= DNS_MAX_RESPONSE) {
+            if (dnsCache.size >= DNS_CACHE_MAX_SIZE) pruneCache()
+            dnsCache[cacheKey] = DnsCacheEntry(answer, now + ttlMs)
+        }
+        writeDnsResponse(srcIp, dstIp, srcPort, answer)
     }
 
     /**
-     * Собирает IPv4+UDP пакет с ответом (src/dst разворачиваются:
-     * источник = адрес виртуального DNS, назначение = клиент) и пишет в туннель.
+     * Проверяет CNAME-цепочку и, если цель в списке, сам записывает блокировку
+     * в статистику/лог и отправляет клиенту ответ. Возвращает true, если
+     * запрос заблокирован.
+     */
+    private fun tryBlockCname(
+        dnsPayload: ByteArray,
+        srcIp: ByteArray,
+        dstIp: ByteArray,
+        srcPort: Int,
+        info: DnsParser.AnswerInfo?
+    ): Boolean {
+        val (target, kind) = blockedCname(info, dnsPayload) ?: return false
+        val qname = DnsParser.readQName(dnsPayload, 12, dnsPayload.size) ?: return false
+        val app = attributedApp(srcIp, dstIp, srcPort)
+        val trackerDisabled = kind == BlockStats.Kind.TRACKER &&
+            !PerAppSettings.isTrackerBlockingEnabled(app)
+        if (trackerDisabled || app in exemptPackages) return false
+
+        val owner = app
+        blockedCount.incrementAndGet()
+        BlockStats.record(owner, qname, kind)
+        val pattern = "CNAME $target"
+        if (RequestLog.isEnabled) {
+            RequestLog.record(
+                owner,
+                qname,
+                if (kind == BlockStats.Kind.TRACKER) RequestLog.Status.TRACKER
+                else RequestLog.Status.ADS,
+                ipToString(srcIp),
+                ipToString(dstIp),
+                pattern
+            )
+        }
+        Log.d(TAG, "Заблокировано по CNAME: $qname -> $target")
+        buildBlockResponse(dnsPayload, 0, dnsPayload.size)?.let {
+            writeDnsResponse(srcIp, dstIp, srcPort, it)
+        }
+        return true
+    }
+
+    /**
+     * Ищет в CNAME-цепочке ответа домен из списков блокировки (CNAME cloaking:
+     * first-party имя маскирует трекер). Возвращает цель и тип блокировки.
+     */
+    private fun blockedCname(
+        info: DnsParser.AnswerInfo?,
+        query: ByteArray
+    ): Pair<String, BlockStats.Kind>? {
+        if (info == null || info.cnames.isEmpty()) return null
+        // На паузе блокировка полностью выключена, включая CNAME-фильтр.
+        if (AppSettings.isPaused()) return null
+        val qname = DnsParser.readQName(query, 12, query.size) ?: return null
+        // Пользовательское разрешение сильнее автоматической CNAME-блокировки.
+        if (HostRules.isAllowed(qname)) return null
+        for (target in info.cnames) {
+            val host = target.lowercase().trimEnd('.')
+            if (host.isEmpty()) continue
+            if (AppSettings.blockTrackers()) {
+                TrackerBlocklist.findMatch(host)?.let {
+                    return target to BlockStats.Kind.TRACKER
+                }
+            }
+            if (AppSettings.blockAds()) {
+                AdBlocklist.findMatch(host)?.let {
+                    return target to BlockStats.Kind.ADS
+                }
+            }
+        }
+        return null
+    }
+
+    /**
+     * TTL кеша из ответа. Записи без ответа кешируем умеренно (120 с), TTL=0
+     * не кешируем вовсе, слишком большие TTL ограничиваем часом, чтобы смена
+     * блоклиста применялась без ожидания суток.
+     */
+    private fun cacheTtlMs(info: DnsParser.AnswerInfo?, answer: ByteArray): Long {
+        if (DnsParser.isTruncated(answer)) return 0L
+        if (info == null || info.minTtl < 0) return DNS_CACHE_TTL_MS
+        if (info.minTtl == 0L) return 0L
+        return (info.minTtl * 1000L)
+            .coerceIn(DNS_CACHE_MIN_TTL_MS, DNS_CACHE_MAX_TTL_MS)
+    }
+
+    /**
+     * Собирает IP+UDP пакет с ответом (src/dst разворачиваются: источник =
+     * адрес виртуального DNS, назначение = клиент) и пишет в туннель.
+     * Семейство адресов ответа совпадает с семейством запроса.
      */
     private fun writeDnsResponse(
+        srcIp: ByteArray,
+        dnsIp: ByteArray,
+        srcPort: Int,
+        dnsPayload: ByteArray
+    ) {
+        if (srcIp.size == 16) {
+            writeIpv6DnsResponse(srcIp, dnsIp, srcPort, dnsPayload)
+        } else {
+            writeIpv4DnsResponse(srcIp, dnsIp, srcPort, dnsPayload)
+        }
+    }
+
+    /** IPv4+UDP пакет с DNS-ответом. */
+    private fun writeIpv4DnsResponse(
         srcIp: ByteArray,
         dnsIp: ByteArray,
         srcPort: Int,
@@ -986,6 +1952,41 @@ class BlockVpnService : VpnService() {
         val udpCsum = udpChecksumFromPacket(out, 8 + dnsPayload.size)
         write16(out, 26, udpCsum)
 
+        writeTunnelResponse(out)
+    }
+
+    /** IPv6+UDP пакет с DNS-ответом (заголовок фиксированной длины, без расширений). */
+    private fun writeIpv6DnsResponse(
+        srcIp: ByteArray,
+        dnsIp: ByteArray,
+        srcPort: Int,
+        dnsPayload: ByteArray
+    ) {
+        val udpLen = 8 + dnsPayload.size
+        val total = 40 + udpLen
+        if (total > MTU) return
+        val out = ByteArray(total)
+
+        out[0] = 0x60.toByte()
+        write16(out, 4, udpLen)          // payload length
+        out[6] = 17                      // next header: UDP
+        out[7] = 64                      // hop limit
+        System.arraycopy(dnsIp, 0, out, 8, 16)   // источник: адрес DNS
+        System.arraycopy(srcIp, 0, out, 24, 16)  // назначение: клиент
+
+        write16(out, 40, DNS_PORT)
+        write16(out, 42, srcPort)
+        write16(out, 44, udpLen)
+        System.arraycopy(dnsPayload, 0, out, 48, dnsPayload.size)
+
+        // В IPv6 контрольная сумма UDP обязательна — нулевое значение запрещено.
+        val udpCsum = udpChecksumFromPacket6(out, udpLen)
+        write16(out, 46, if (udpCsum == 0) 0xFFFF else udpCsum)
+
+        writeTunnelResponse(out)
+    }
+
+    private fun writeTunnelResponse(out: ByteArray) {
         try {
             writeToTunnel(out)
         } catch (e: ErrnoException) {
@@ -1032,6 +2033,20 @@ class BlockVpnService : VpnService() {
         packet[offset + 1] = value.toByte()
     }
 
+    private fun write32(packet: ByteArray, offset: Int, value: Int) {
+        packet[offset] = (value ushr 24).toByte()
+        packet[offset + 1] = (value ushr 16).toByte()
+        packet[offset + 2] = (value ushr 8).toByte()
+        packet[offset + 3] = value.toByte()
+    }
+
+    /** Адрес в читаемом виде для логов: IPv4 или IPv6. */
+    private fun ipToString(address: ByteArray): String = try {
+        InetAddress.getByAddress(address).hostAddress ?: address.joinToString(".")
+    } catch (e: Exception) {
+        address.joinToString(".")
+    }
+
     /** Контрольная сумма (RFC 1071). Нечётный хвост дополняется нулевым байтом. */
     private fun ipChecksum(data: ByteArray): Int {
         var sum = 0L
@@ -1063,9 +2078,30 @@ class BlockVpnService : VpnService() {
         return ipChecksum(buf)
     }
 
+    /**
+     * Контрольная сумма UDP поверх IPv6: псевдозаголовок из адресов [8..40],
+     * длины верхнего уровня, нулей и номера протокола (RFC 8200).
+     */
+    private fun udpChecksumFromPacket6(packet: ByteArray, udpLen: Int): Int {
+        val buf = ByteArray(40 + udpLen)
+        System.arraycopy(packet, 8, buf, 0, 32)   // IPv6-адреса источника и назначения
+        write32(buf, 32, udpLen)                  // длина UDP-датаграммы
+        buf[39] = 17                              // следующий заголовок: UDP
+        System.arraycopy(packet, 40, buf, 40, udpLen)
+        return ipChecksum(buf)
+    }
+
     private fun pruneCache() {
         val now = System.currentTimeMillis()
         dnsCache.keys.removeIf { key -> dnsCache[key]?.let { it.expiresAt < now } ?: true }
+        // Протухших записей может не быть вовсе — тогда освобождаем четверть
+        // самых старых, иначе словарь растёт выше лимита.
+        if (dnsCache.size >= DNS_CACHE_MAX_SIZE) {
+            val victims = dnsCache.entries
+                .sortedBy { it.value.expiresAt }
+                .take((DNS_CACHE_MAX_SIZE / 4).coerceAtLeast(1))
+            for (entry in victims) dnsCache.remove(entry.key, entry.value)
+        }
     }
 
     // ————————————————————— уведомление —————————————————————
@@ -1082,18 +2118,21 @@ class BlockVpnService : VpnService() {
     }
 
     private fun showNotification() {
-        val paused = AppSettings.isPaused()
+        val waiting = awaitingOtherVpn
+        val paused = !waiting && AppSettings.isPaused()
+        val title = when {
+            waiting -> getString(R.string.notification_waiting_title)
+            paused -> getString(R.string.notification_paused_title)
+            else -> getString(R.string.notification_title)
+        }
+        val text = when {
+            waiting -> getString(R.string.notification_waiting_text)
+            paused -> getString(R.string.notification_paused_text, pauseEndText())
+            else -> blockingStatusText()
+        }
         val builder = Notification.Builder(this, CHANNEL_ID)
-            .setContentTitle(
-                getString(
-                    if (paused) R.string.notification_paused_title
-                    else R.string.notification_title
-                )
-            )
-            .setContentText(
-                if (paused) getString(R.string.notification_paused_text, pauseEndText())
-                else blockingStatusText()
-            )
+            .setContentTitle(title)
+            .setContentText(text)
             .setSmallIcon(R.drawable.ic_stat_shield)
             .setContentIntent(
                 PendingIntent.getActivity(
@@ -1104,7 +2143,16 @@ class BlockVpnService : VpnService() {
             .setOngoing(true)
             .setOnlyAlertOnce(true)
 
-        if (paused) {
+        if (waiting) {
+            builder.addAction(
+                notificationAction(
+                    R.drawable.ic_notif_resume,
+                    R.string.notification_action_resume_now,
+                    ACTION_RESUME_NOW,
+                    REQUEST_RESUME_NOW
+                )
+            )
+        } else if (paused) {
             builder.addAction(
                 notificationAction(
                     R.drawable.ic_notif_resume,

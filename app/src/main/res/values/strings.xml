@@ -10,8 +10,13 @@
     <string name="notification_action_pause">Пауза 15 мин</string>
     <string name="notification_action_resume">Возобновить</string>
     <string name="notification_action_stop">Стоп</string>
+    <string name="notification_waiting_title">Другой VPN активен</string>
+    <string name="notification_waiting_text">AntiTrack вернётся автоматически, когда другой VPN будет отключён</string>
+    <string name="notification_action_resume_now">Включить сейчас</string>
 
     <string name="status_off">Защита выключена</string>
+    <string name="status_waiting">Ждём отключения другого VPN</string>
+    <string name="status_description_waiting">Защита включится снова автоматически, как только вы отключите другой VPN. Нажмите «Включить сейчас», чтобы вернуть AntiTrack немедленно.</string>
     <string name="status_on">Защита включена</string>
     <string name="status_paused">Защита на паузе</string>
     <string name="status_description_paused">Блокировка приостановлена до %1$s</string>
@@ -38,9 +43,18 @@
     <string name="tabs_trackers">Трекеры</string>
     <string name="tabs_ads">Реклама</string>
     <string name="stats_empty">Пока ничего не заблокировано</string>
+    <string name="stats_empty_period">За этот период блокировок нет</string>
+    <string name="stats_period_today">Сегодня</string>
+    <string name="stats_period_week">7 дней</string>
+    <string name="stats_period_all">Всё время</string>
+    <string name="stats_summary_today">Сегодня заблокировано</string>
+    <string name="stats_summary_week">За 7 дней заблокировано</string>
+    <string name="stats_summary_all">Всего заблокировано</string>
     <string name="stats_reset">Сбросить</string>
     <string name="stats_usage_access_hint">Для точной статистики разрешите «Доступ к использованию приложений», иначе блокировки будут писаться в «Систему»</string>
     <string name="dialog_close">Закрыть</string>
+    <string name="stats_possible_misattribution">* - возможно ошибочное определение</string>
+    <string name="stats_meta_affiliation_note">** - продукт компании Meta, деятельность которой признана экстремистской и запрещена в России</string>
 
     <string name="update_available_title">Доступно обновление</string>
     <string name="update_available_message">Доступна новая версия %1$s. У вас установлена %2$s.</string>
@@ -97,6 +111,43 @@
 
     <!-- Раздел настроек -->
     <string name="settings_section_protection">Защита</string>
+    <string name="settings_section_dns">DNS-сервер</string>
+    <string name="settings_dns_hint">Разрешённые запросы пересылаются выбранному серверу. «Системный» использует DNS вашей Wi-Fi или мобильной сети — это быстрее всего и не ломает локальные имена.</string>
+    <string name="settings_dns_system">Системный (по умолчанию)</string>
+    <string name="settings_dns_yandex">Яндекс.DNS</string>
+    <string name="settings_dns_adguard">AdGuard DNS</string>
+    <string name="settings_dns_cloudflare">Cloudflare (1.1.1.1)</string>
+    <string name="settings_dns_google">Google (8.8.8.8)</string>
+    <string name="settings_dns_quad9">Quad9</string>
+    <string name="settings_dns_opendns">OpenDNS</string>
+    <string name="settings_dns_custom">Свой сервер</string>
+    <string name="settings_dns_custom_hint">IP-адреса через запятую, например 1.1.1.1, 8.8.8.8</string>
+    <string name="settings_dns_custom_warning">Убедитесь, что сервер доступен в России и отвечает по UDP:53. Если интернет перестал работать, верните системный DNS.</string>
+    <string name="settings_dns_russia_warning">Этот DNS может быть недоступен в России: запросы будут идти медленнее или перестанут разрешаться. Если интернет «пропал», верните системный DNS.</string>
+    <string name="settings_dns_encrypt">Шифровать DNS (DoT)</string>
+    <string name="settings_dns_encrypt_hint">DNS over TLS скрывает запросы от провайдера. Если сервер не поддерживает DoT, автоматически используется обычный UDP:53.</string>
+    <string name="settings_dns_private_hint">Если в Android включён «Частный DNS» (Private DNS), часть запросов может идти мимо фильтра. Для полной блокировки выберите там «Авто» или отключите его.</string>
+    <string name="settings_dns_private_enabled_warning">Сейчас включён «Частный DNS» с указанным сервером: такие запросы идут мимо AntiTrack. Отключите его или выберите режим «Авто», чтобы блокировка работала полностью.</string>
+    <string name="settings_dns_private_open">Настройки частного DNS</string>
+    <string name="settings_section_block_response">Ответ на блокировку</string>
+    <string name="settings_block_response_nxdomain">NXDOMAIN — «домена не существует» (рекомендуется)</string>
+    <string name="settings_block_response_null">0.0.0.0 / :: — нулевой адрес</string>
+    <string name="settings_block_response_hint">NXDOMAIN сразу завершает запрос. Нулевой адрес помогает приложениям, которые плохо переносят NXDOMAIN, но может вызывать повторные попытки.</string>
+    <string name="settings_section_autostart">Автозапуск после перезагрузки</string>
+    <string name="settings_autostart_hint">Если защита была включена, AntiTrack поднимается сам после перезагрузки. На Oppo/ColorOS, Xiaomi, Huawei и подобных прошивках для этого нужно разрешить автозапуск приложения. Самый надёжный способ — включить для AntiTrack «Постоянную VPN» в настройках Android: тогда систему запускает сама Android, и ограничения производителя не мешают. Учтите: при включённой постоянной VPN выключить защиту можно только там же, иначе система запустит её снова.</string>
+    <string name="settings_autostart_open">Разрешить автозапуск</string>
+    <string name="settings_always_on_vpn">Постоянная VPN (настройки Android)</string>
+    <string name="settings_autostart_never">Автозапуск ещё не срабатывал: после установки не было перезагрузки либо система не доставила событие.</string>
+    <string name="settings_autostart_last">Последняя попытка: %1$s — %2$s</string>
+    <string name="settings_autostart_started">защита запущена</string>
+    <string name="settings_autostart_requested">запрос отправлен, но сервис не запустился</string>
+    <string name="settings_autostart_no_consent">нет согласия на VPN</string>
+    <string name="settings_autostart_error">ошибка запуска</string>
+    <string name="settings_autostart_disabled">защита была выключена</string>
+    <string name="settings_section_excluded">Исключения из VPN</string>
+    <string name="settings_excluded_hint">Эти приложения не проходят через VPN и не фильтруются. Список пополняется, если отключить блокировку трекеров в статистике приложения.</string>
+    <string name="settings_excluded_empty">Нет приложений, исключённых из VPN</string>
+    <string name="settings_excluded_restore">Вернуть в VPN</string>
     <string name="settings_blocklists">Блоклисты</string>
     <string name="settings_update_blocklists">Обновить блоклисты</string>
     <string name="settings_update_blocklists_done">Блоклисты обновлены</string>
@@ -105,6 +156,7 @@
     <string name="settings_blocklists_updated">Обновлены: %1$s</string>
     <string name="settings_blocklists_never">Ещё не обновлялись</string>
     <string name="settings_block_trackers_for_app">Блокировать трекеры для этого приложения</string>
+    <string name="settings_app_excluded_hint">Если выключить, приложение будет полностью исключено из VPN, и его трафик не будет фильтроваться.</string>
     <string name="settings_section_rules">Правила</string>
     <string name="settings_open_rules">Пользовательские правила</string>
     <string name="settings_rules_summary">Заблокировано вручную: %1$d · разрешено: %2$d</string>

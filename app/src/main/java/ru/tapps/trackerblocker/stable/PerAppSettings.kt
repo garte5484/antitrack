@@ -29,4 +29,16 @@ object PerAppSettings {
     fun setTrackerBlockingEnabled(packageName: String, enabled: Boolean) {
         prefs?.edit()?.putBoolean(KEY_BLOCK_TRACKERS_PREFIX + packageName, enabled)?.apply()
     }
+
+    /**
+     * Пакеты, для которых блокировка трекеров выключена. Они полностью
+     * исключаются из VPN, чтобы их DNS-трафик шёл напрямую.
+     */
+    fun disabledTrackerPackages(): Set<String> {
+        val all = prefs?.all ?: return emptySet()
+        return all.asSequence()
+            .filter { (key, value) -> key.startsWith(KEY_BLOCK_TRACKERS_PREFIX) && value == false }
+            .map { (key, _) -> key.removePrefix(KEY_BLOCK_TRACKERS_PREFIX) }
+            .toSet()
+    }
 }
