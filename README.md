@@ -1,6 +1,7 @@
 # AntiTrack
 
 ![Downloads](https://img.shields.io/github/downloads/garte5484/antitrack/total)
+![Downloads](https://img.shields.io/github/downloads/garte5484/antitrack/latest/total)
 
 Локальный блокировщик трекеров и рекламы для Android. Работает через собственный
 VPN-сервис, который фильтрует DNS-запросы на устройстве: трафик приложений не
