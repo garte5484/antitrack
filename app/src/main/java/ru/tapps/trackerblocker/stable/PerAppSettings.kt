@@ -41,4 +41,17 @@ object PerAppSettings {
             .map { (key, _) -> key.removePrefix(KEY_BLOCK_TRACKERS_PREFIX) }
             .toSet()
     }
+
+    /** Полностью заменяет список исключённых приложений (импорт резервной копии). */
+    fun replaceDisabledPackages(packages: Set<String>) {
+        val p = prefs ?: return
+        val editor = p.edit()
+        for (key in p.all.keys) {
+            if (key.startsWith(KEY_BLOCK_TRACKERS_PREFIX)) editor.remove(key)
+        }
+        for (pkg in packages) {
+            if (pkg.isNotBlank()) editor.putBoolean(KEY_BLOCK_TRACKERS_PREFIX + pkg, false)
+        }
+        editor.apply()
+    }
 }

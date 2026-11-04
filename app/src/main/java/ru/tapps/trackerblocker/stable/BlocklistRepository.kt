@@ -31,6 +31,24 @@ object BlocklistRepository {
     private const val KEY_TIMESTAMP = "timestamp"
     private const val KEY_VERSION = "version"
 
+    /** Настройки автообновления списков (общие и по каждому списку). */
+    private const val PREF_SETTINGS = "blocklist_settings"
+    private const val KEY_AUTO_UPDATE_ALL = "auto_update_all"
+    private const val KEY_AUTO_UPDATE_PREFIX = "auto_update_"
+
+    /** Какой именно список: у каждого свой URL, кеш и настройки. */
+    enum class Kind { TRACKERS, ADS }
+
+    /** Состояние списка для экрана управления. */
+    data class ListState(
+        val kind: Kind,
+        val count: Int,
+        val bytes: Long,
+        val lastUpdated: Long,
+        val autoUpdate: Boolean,
+        val url: String
+    )
+
     /** Результат принудительного обновления блоклистов. */
     enum class RefreshResult { SUCCESS, NO_INTERNET, FAILED }
 
@@ -42,7 +60,7 @@ object BlocklistRepository {
 
     private class Source(
         private val sourceName: String,
-        private val url: String,
+        val url: String,
         private val prefName: String,
         private val cacheVersion: Int,
         private val cacheFileName: String,
@@ -62,22 +80,23 @@ object BlocklistRepository {
 
         private fun cacheFile(context: Context): File = File(context.filesDir, cacheFileName)
 
-        fun refreshIfStale(context: Context) {
+        fun refreshIfStale(context: Context, allowDownload: Boolean = true) {
             val app = context.applicationContext
             synchronized(lock) {
+                // Кеш поднимаем всегда: даже с выключенным автообновлением
+                // фильтрация должна работать на последней скачанной версии.
+                ensureLoadedLocked(app)
+                if (!allowDownload) return
+
                 val cachedTime = prefs(app).getLong(KEY_TIMESTAMP, 0L)
                 val cachedVersion = prefs(app).getInt(KEY_VERSION, 0)
                 val now = System.currentTimeMillis()
 
                 if (cachedVersion == cacheVersion && cachedTime != 0L && now - cachedTime < CACHE_TTL_MS) {
-                    ensureLoadedLocked(app) // кеш свежий — просто поднять в память
-                    return
+                    return // кеш свежий и уже загружен
                 }
 
-                if (!BlocklistRepository.hasInternet(app)) {
-                    ensureLoadedLocked(app)
-                    return
-                }
+                if (!BlocklistRepository.hasInternet(app)) return
 
                 val fresh = try {
                     download()
@@ -125,6 +144,17 @@ object BlocklistRepository {
 
         /** Время последнего успешного скачивания списка, мс (0 — ещё не качали). */
         fun lastUpdated(app: Context): Long = prefs(app).getLong(KEY_TIMESTAMP, 0L)
+
+        /** Размер файла кеша в байтах (0 — кеша ещё нет). */
+        fun cacheBytes(app: Context): Long = cacheFile(app).length()
+
+        /** Снимок загруженных записей; при необходимости сначала читает кеш. */
+        fun snapshot(app: Context): List<String> {
+            synchronized(lock) {
+                ensureLoadedLocked(app)
+                return current.sorted()
+            }
+        }
 
         private fun ensureLoadedLocked(app: Context) {
             if (current.isNotEmpty()) return
@@ -197,6 +227,36 @@ object BlocklistRepository {
         cacheFileName = "antitrack_adblock.txt"
     ) { AdBlocklist.updateCustom(it) }
 
+    private fun source(kind: Kind): Source = when (kind) {
+        Kind.TRACKERS -> trackersSource
+        Kind.ADS -> adsSource
+    }
+
+    private fun settingsPrefs(context: Context): SharedPreferences =
+        context.applicationContext.getSharedPreferences(PREF_SETTINGS, Context.MODE_PRIVATE)
+
+    /** Глобальный переключатель автообновления всех списков. */
+    fun isAutoUpdateEnabled(context: Context): Boolean =
+        settingsPrefs(context).getBoolean(KEY_AUTO_UPDATE_ALL, true)
+
+    fun setAutoUpdateEnabled(context: Context, enabled: Boolean) {
+        settingsPrefs(context).edit().putBoolean(KEY_AUTO_UPDATE_ALL, enabled).apply()
+    }
+
+    /** Автообновление отдельного списка (действует только при включённом общем). */
+    fun isListAutoUpdateEnabled(context: Context, kind: Kind): Boolean =
+        settingsPrefs(context).getBoolean(KEY_AUTO_UPDATE_PREFIX + kind.name, true)
+
+    fun setListAutoUpdateEnabled(context: Context, kind: Kind, enabled: Boolean) {
+        settingsPrefs(context)
+            .edit()
+            .putBoolean(KEY_AUTO_UPDATE_PREFIX + kind.name, enabled)
+            .apply()
+    }
+
+    private fun shouldAutoUpdate(context: Context, kind: Kind): Boolean =
+        isAutoUpdateEnabled(context) && isListAutoUpdateEnabled(context, kind)
+
     /** Число доменов/ключевых слов в списке трекеров. */
     val trackerCount: Int
         get() = trackersSource.size
@@ -205,14 +265,16 @@ object BlocklistRepository {
     val adCount: Int
         get() = adsSource.size
 
+    fun count(kind: Kind): Int = source(kind).size
+
     /**
      * Обновляет оба списка при необходимости. Вызывается при входе в приложение
      * и при старте VPN-сервиса (не на главном потоке).
      */
     fun refreshIfStale(context: Context) {
         val app = context.applicationContext
-        trackersSource.refreshIfStale(app)
-        adsSource.refreshIfStale(app)
+        trackersSource.refreshIfStale(app, shouldAutoUpdate(app, Kind.TRACKERS))
+        adsSource.refreshIfStale(app, shouldAutoUpdate(app, Kind.ADS))
     }
 
     /**
@@ -233,11 +295,48 @@ object BlocklistRepository {
         return if (trackersOk && adsOk) RefreshResult.SUCCESS else RefreshResult.FAILED
     }
 
+    /** Принудительно обновляет один список. Блокирующий вызов. */
+    fun forceRefresh(context: Context, kind: Kind): RefreshResult {
+        val app = context.applicationContext
+        val src = source(kind)
+        if (!hasInternet(app)) {
+            src.loadFromCache(app)
+            return RefreshResult.NO_INTERNET
+        }
+        return if (src.forceRefresh(app)) RefreshResult.SUCCESS else RefreshResult.FAILED
+    }
+
     /** Время последнего успешного обновления любого из списков, мс. */
     fun lastUpdated(context: Context): Long {
         val app = context.applicationContext
         return maxOf(trackersSource.lastUpdated(app), adsSource.lastUpdated(app))
     }
+
+    fun lastUpdated(context: Context, kind: Kind): Long {
+        val app = context.applicationContext
+        return source(kind).lastUpdated(app)
+    }
+
+    /** Состояние одного списка для экрана управления. */
+    fun state(context: Context, kind: Kind): ListState {
+        val app = context.applicationContext
+        val src = source(kind)
+        return ListState(
+            kind = kind,
+            count = src.size,
+            bytes = src.cacheBytes(app),
+            lastUpdated = src.lastUpdated(app),
+            autoUpdate = isListAutoUpdateEnabled(app, kind),
+            url = src.url
+        )
+    }
+
+    fun states(context: Context): List<ListState> =
+        Kind.entries.map { state(context, it) }
+
+    /** Содержимое списка (отсортированное). Блокирующий вызов — не на главном потоке. */
+    fun entries(context: Context, kind: Kind): List<String> =
+        source(kind).snapshot(context.applicationContext)
 
     private fun hasInternet(context: Context): Boolean {
         return try {

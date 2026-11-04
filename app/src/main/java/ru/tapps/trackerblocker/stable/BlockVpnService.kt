@@ -712,6 +712,7 @@ class BlockVpnService : VpnService() {
             tunnel = null
             tunnelWriter = null
             Log.i(TAG, "VPN остановлен")
+            QuickTileService.notifyStateChanged(this)
         }
     }
 
@@ -1399,7 +1400,7 @@ class BlockVpnService : VpnService() {
             return
         }
 
-        // Пользовательские правила работают по точному хосту
+        // Пользовательские правила: домен и все его поддомены
         if (HostRules.isBlocked(qname)) {
             val appRule = if (logging || activeThrottles > 0) {
                 attributedApp(srcIp, dstIp, srcPort)
@@ -2328,6 +2329,7 @@ class BlockVpnService : VpnService() {
             startForeground(NOTIFICATION_ID, notification)
         }
         schedulePauseEndRefresh()
+        QuickTileService.notifyStateChanged(this)
     }
 
     private fun notificationAction(

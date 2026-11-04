@@ -14,6 +14,13 @@
     <string name="notification_waiting_text">AntiTrack вернётся автоматически, когда другой VPN будет отключён</string>
     <string name="notification_action_resume_now">Включить сейчас</string>
 
+    <!-- Плитка быстрых настроек -->
+    <string name="tile_label">AntiTrack</string>
+    <string name="tile_subtitle_on">Защита включена</string>
+    <string name="tile_subtitle_off">Защита выключена</string>
+    <string name="tile_subtitle_paused">Пауза</string>
+    <string name="tile_subtitle_waiting">Ждём другой VPN</string>
+
     <string name="status_off">Защита выключена</string>
     <string name="status_waiting">Ждём отключения другого VPN</string>
     <string name="status_description_waiting">Защита включится снова автоматически, как только вы отключите другой VPN. Нажмите «Включить сейчас», чтобы вернуть AntiTrack немедленно.</string>
@@ -149,12 +156,44 @@
     <string name="settings_excluded_empty">Нет приложений, исключённых из VPN</string>
     <string name="settings_excluded_restore">Вернуть в VPN</string>
     <string name="settings_blocklists">Блоклисты</string>
-    <string name="settings_update_blocklists">Обновить блоклисты</string>
+    <string name="settings_open_blocklists">Управление списками</string>
     <string name="settings_update_blocklists_done">Блоклисты обновлены</string>
     <string name="settings_update_blocklists_no_internet">Нет подключения к интернету</string>
     <string name="settings_update_blocklists_failed">Не удалось обновить блоклисты</string>
     <string name="settings_blocklists_updated">Обновлены: %1$s</string>
     <string name="settings_blocklists_never">Ещё не обновлялись</string>
+
+    <!-- Экран блоклистов -->
+    <string name="blocklists_title">Блоклисты</string>
+    <string name="blocklists_back">Назад</string>
+    <string name="blocklists_autoupdate_all">Автообновление списков</string>
+    <string name="blocklists_autoupdate_all_hint">Если выключить, списки будут обновляться только вручную.</string>
+    <string name="blocklists_trackers">Трекеры</string>
+    <string name="blocklists_ads">Реклама</string>
+    <string name="blocklists_source">Источник: %1$s</string>
+    <string name="blocklists_state">Записей: %1$d · %2$s · %3$s</string>
+    <string name="blocklists_autoupdate">Автообновление</string>
+    <string name="blocklists_update">Обновить</string>
+    <string name="blocklists_update_all">Обновить все</string>
+    <string name="blocklists_updated_at">обновлён %1$s</string>
+    <string name="blocklists_never">ещё не обновлялся</string>
+    <string name="blocklists_open">Показать содержимое</string>
+    <string name="blocklists_search">Поиск по списку</string>
+    <string name="blocklists_entries">Записей: %1$d</string>
+    <string name="blocklists_empty">Список пуст</string>
+    <string name="blocklists_not_found">Ничего не найдено</string>
+    <string name="blocklists_update_done">Список обновлён</string>
+    <string name="blocklists_update_failed">Не удалось обновить список</string>
+
+    <!-- Резервная копия -->
+    <string name="settings_section_backup">Резервная копия</string>
+    <string name="settings_backup_hint">Настройки, правила и исключения можно сохранить в файл и восстановить на другом устройстве. Статистика не переносится.</string>
+    <string name="settings_backup_export">Экспортировать</string>
+    <string name="settings_backup_import">Импортировать</string>
+    <string name="settings_backup_done">Копия сохранена</string>
+    <string name="settings_backup_imported">Импортировано: правил — %1$d, приложений — %2$d</string>
+    <string name="settings_backup_invalid">Не удалось прочитать файл: это не копия AntiTrack</string>
+    <string name="settings_backup_error">Не удалось сохранить или прочитать файл</string>
     <string name="settings_block_trackers_for_app">Блокировать трекеры для этого приложения</string>
     <string name="settings_app_excluded_hint">Если выключить, приложение будет полностью исключено из VPN, и его трафик не будет фильтроваться.</string>
     <string name="settings_section_rules">Правила</string>
@@ -169,7 +208,7 @@
     <!-- Пользовательские правила -->
     <string name="rules_title">Пользовательские правила</string>
     <string name="rules_back">Назад</string>
-    <string name="rules_hint">Правила действуют на точный хост. Разрешение отменяет блокировку из встроенных списков.</string>
+    <string name="rules_hint">Правило действует на домен и все его поддомены: example.com блокирует ads.example.com и 1.ads.example.com. Более точное правило важнее общего. Разрешение отменяет блокировку из встроенных списков.</string>
     <string name="rules_add_hint">Домен, например example.com</string>
     <string name="rules_add_block">Заблокировать</string>
     <string name="rules_add_allow">Разрешить</string>

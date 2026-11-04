@@ -48,16 +48,45 @@ object HostRules {
 
     private fun normalize(host: String): String = host.lowercase().trim().trimEnd('.')
 
-    fun isBlocked(host: String): Boolean {
-        val h = normalize(host)
-        if (h in allowed) return false
-        if (h in blocked) return true
-        return false
+    fun isBlocked(host: String): Boolean = decide(host, blocked, allowed)
+
+    fun isAllowed(host: String): Boolean = matchesRule(host, allowed)
+
+    /**
+     * Проверяет, есть ли в наборе правило для хоста или любого его родительского
+     * домена: правило example.com подходит и для ads.example.com.
+     */
+    internal fun matchesRule(host: String, rules: Set<String>): Boolean {
+        var suffix = normalize(host)
+        if (suffix.isEmpty()) return false
+        while (true) {
+            if (suffix in rules) return true
+            val dot = suffix.indexOf('.')
+            if (dot < 0) return false
+            suffix = suffix.substring(dot + 1)
+        }
     }
 
-    fun isAllowed(host: String): Boolean {
-        val h = normalize(host)
-        return h in allowed
+    /**
+     * Итоговое решение по ручным правилам: идём от самого точного суффикса к
+     * самому общему, поэтому правило для ads.example.com важнее правила для
+     * example.com. Блокировка домена действует на все его поддомены, но не на
+     * соседние домены.
+     */
+    internal fun decide(
+        host: String,
+        blockedRules: Set<String>,
+        allowedRules: Set<String>
+    ): Boolean {
+        var suffix = normalize(host)
+        if (suffix.isEmpty()) return false
+        while (true) {
+            if (suffix in allowedRules) return false
+            if (suffix in blockedRules) return true
+            val dot = suffix.indexOf('.')
+            if (dot < 0) return false
+            suffix = suffix.substring(dot + 1)
+        }
     }
 
     fun forceBlock(host: String) {
@@ -85,6 +114,21 @@ object HostRules {
     fun blockedHosts(): Set<String> = blocked
 
     fun allowedHosts(): Set<String> = allowed
+
+    /**
+     * Полностью заменяет правила (импорт резервной копии). Значения
+     * нормализуются, пустые строки отбрасываются.
+     */
+    fun replaceAll(blockedHosts: Set<String>, allowedHosts: Set<String>) {
+        val b = blockedHosts.mapNotNull { normalize(it).takeIf(String::isNotEmpty) }.toSet()
+        val a = allowedHosts.mapNotNull { normalize(it).takeIf(String::isNotEmpty) }.toSet()
+        synchronized(lock) {
+            blocked = b
+            allowed = a
+            saveSet(KEY_BLOCKED, blocked)
+            saveSet(KEY_ALLOWED, allowed)
+        }
+    }
 
     /** Убирает правило ручной блокировки. */
     fun removeBlocked(host: String) {

@@ -12,8 +12,10 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Process
 import android.provider.Settings
+import android.text.format.Formatter
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
@@ -417,6 +419,7 @@ fun AntiTrackScreen(
     var blockAds by remember { mutableStateOf(AppSettings.blockAds()) }
     var currentTab by remember { mutableStateOf(AppTab.HOME) }
     var showRules by remember { mutableStateOf(false) }
+    var showBlocklists by remember { mutableStateOf(false) }
     var paused by remember { mutableStateOf(AppSettings.isPaused()) }
     val context = LocalContext.current
     var usageAccess by remember { mutableStateOf(hasUsageAccess(context)) }
@@ -435,7 +438,9 @@ fun AntiTrackScreen(
         }
     }
 
-    BackHandler(enabled = showRules) { showRules = false }
+    BackHandler(enabled = showRules || showBlocklists) {
+        if (showBlocklists) showBlocklists = false else showRules = false
+    }
 
     val pausedUntilText = remember(paused) {
         if (paused) {
@@ -506,7 +511,7 @@ fun AntiTrackScreen(
     Scaffold(
         modifier = Modifier.fillMaxSize(),
         bottomBar = {
-            if (!showRules) {
+            if (!showRules && !showBlocklists) {
                 NavigationBar {
                     AppTab.entries.forEach { tab ->
                         NavigationBarItem(
@@ -515,6 +520,7 @@ fun AntiTrackScreen(
                                 currentTab = tab
                                 selectedApp = null
                                 showRules = false
+                                showBlocklists = false
                             },
                             icon = {
                                 Icon(
@@ -529,7 +535,12 @@ fun AntiTrackScreen(
             }
         }
     ) { innerPadding ->
-        if (showRules) {
+        if (showBlocklists) {
+            BlocklistsScreen(
+                modifier = Modifier.padding(innerPadding),
+                onBack = { showBlocklists = false }
+            )
+        } else if (showRules) {
             RulesScreen(
                 modifier = Modifier.padding(innerPadding),
                 onBack = { showRules = false }
@@ -730,7 +741,13 @@ fun AntiTrackScreen(
                     applyServiceSettings()
                 },
                 onExclusionsChanged = applyServiceSettings,
-                onOpenRules = { showRules = true }
+                onOpenRules = { showRules = true },
+                onOpenBlocklists = { showBlocklists = true },
+                onSettingsImported = {
+                    blockTrackers = AppSettings.blockTrackers()
+                    blockAds = AppSettings.blockAds()
+                    applyServiceSettings()
+                }
             )
         }
     }
@@ -1341,11 +1358,12 @@ private fun SettingsScreen(
     onBlockTrackersChange: (Boolean) -> Unit,
     onBlockAdsChange: (Boolean) -> Unit,
     onExclusionsChanged: () -> Unit,
-    onOpenRules: () -> Unit
+    onOpenRules: () -> Unit,
+    onOpenBlocklists: () -> Unit,
+    onSettingsImported: () -> Unit
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    var updating by remember { mutableStateOf(false) }
     var message by remember { mutableStateOf<String?>(null) }
     var lastUpdated by remember { mutableStateOf(BlocklistRepository.lastUpdated(context)) }
     var excluded by remember { mutableStateOf(PerAppSettings.disabledTrackerPackages()) }
@@ -1353,6 +1371,66 @@ private fun SettingsScreen(
     var customDns by remember { mutableStateOf(AppSettings.customDnsRaw()) }
     var dnsEncrypt by remember { mutableStateOf(AppSettings.dnsEncryptionEnabled()) }
     var blockNull by remember { mutableStateOf(AppSettings.blockWithNullAddress()) }
+
+    val exportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/json")
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        val saved = try {
+            context.contentResolver.openOutputStream(uri)?.use { out ->
+                out.write(SettingsBackup.export(context).toByteArray(Charsets.UTF_8))
+            } != null
+        } catch (e: Exception) {
+            false
+        }
+        message = context.getString(
+            if (saved) R.string.settings_backup_done else R.string.settings_backup_error
+        )
+    }
+    val importLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        message = null
+        scope.launch {
+            val text = withContext(Dispatchers.IO) {
+                try {
+                    context.contentResolver.openInputStream(uri)?.use { input ->
+                        val bytes = input.readBytes()
+                        if (bytes.size > 1_000_000) null
+                        else bytes.toString(Charsets.UTF_8)
+                    }
+                } catch (e: Exception) {
+                    null
+                }
+            }
+            if (text == null) {
+                message = context.getString(R.string.settings_backup_error)
+                return@launch
+            }
+            val result = withContext(Dispatchers.IO) {
+                SettingsBackup.import(context, text)
+            }
+            if (result.success) {
+                // Импорт меняет состояние настроек напрямую в SharedPreferences,
+                // поэтому перечитываем локальные значения и сообщаем сервису.
+                dnsProviderId = AppSettings.dnsProviderId()
+                customDns = AppSettings.customDnsRaw()
+                dnsEncrypt = AppSettings.dnsEncryptionEnabled()
+                blockNull = AppSettings.blockWithNullAddress()
+                excluded = PerAppSettings.disabledTrackerPackages()
+                lastUpdated = BlocklistRepository.lastUpdated(context)
+                onSettingsImported()
+                message = context.getString(
+                    R.string.settings_backup_imported,
+                    result.rules,
+                    result.apps
+                )
+            } else {
+                message = context.getString(R.string.settings_backup_invalid)
+            }
+        }
+    }
     val selectedProvider = DnsProviders.byId(dnsProviderId)
     // «Частный DNS» в режиме «Имя хоста» уводит DoT мимо VPN-резолвера.
     val privateDnsForced = remember {
@@ -1596,43 +1674,8 @@ private fun SettingsScreen(
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
         Spacer(Modifier.height(8.dp))
-        Button(
-            onClick = {
-                updating = true
-                message = null
-                scope.launch {
-                    val result = withContext(Dispatchers.IO) {
-                        BlocklistRepository.forceRefresh(context)
-                    }
-                    updating = false
-                    lastUpdated = BlocklistRepository.lastUpdated(context)
-                    message = context.getString(
-                        when (result) {
-                            BlocklistRepository.RefreshResult.SUCCESS ->
-                                R.string.settings_update_blocklists_done
-                            BlocklistRepository.RefreshResult.NO_INTERNET ->
-                                R.string.settings_update_blocklists_no_internet
-                            BlocklistRepository.RefreshResult.FAILED ->
-                                R.string.settings_update_blocklists_failed
-                        }
-                    )
-                }
-            },
-            enabled = !updating
-        ) {
-            Text(stringResource(R.string.settings_update_blocklists))
-        }
-        if (updating) {
-            Spacer(Modifier.height(8.dp))
-            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-        }
-        message?.let {
-            Spacer(Modifier.height(8.dp))
-            Text(
-                text = it,
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
+        OutlinedButton(onClick = onOpenBlocklists) {
+            Text(stringResource(R.string.settings_open_blocklists))
         }
 
         Spacer(Modifier.height(20.dp))
@@ -1649,6 +1692,41 @@ private fun SettingsScreen(
         Spacer(Modifier.height(8.dp))
         OutlinedButton(onClick = onOpenRules) {
             Text(stringResource(R.string.settings_open_rules))
+        }
+
+        Spacer(Modifier.height(20.dp))
+        SectionTitle(stringResource(R.string.settings_section_backup))
+        Text(
+            text = stringResource(R.string.settings_backup_hint),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Spacer(Modifier.height(8.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(
+                onClick = {
+                    val name = "antitrack-backup-" +
+                        SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date()) + ".json"
+                    exportLauncher.launch(name)
+                },
+                modifier = Modifier.weight(1f)
+            ) {
+                Text(stringResource(R.string.settings_backup_export))
+            }
+            OutlinedButton(
+                onClick = { importLauncher.launch(arrayOf("*/*")) },
+                modifier = Modifier.weight(1f)
+            ) {
+                Text(stringResource(R.string.settings_backup_import))
+            }
+        }
+        message?.let {
+            Spacer(Modifier.height(8.dp))
+            Text(
+                text = it,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
         }
 
         Spacer(Modifier.height(20.dp))
@@ -1706,6 +1784,286 @@ private fun SettingsRadioRow(text: String, selected: Boolean, onClick: () -> Uni
             style = MaterialTheme.typography.bodyMedium,
             modifier = Modifier.padding(start = 4.dp)
         )
+    }
+}
+
+@Composable
+private fun BlocklistsScreen(
+    modifier: Modifier = Modifier,
+    onBack: () -> Unit
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var autoAll by remember { mutableStateOf(BlocklistRepository.isAutoUpdateEnabled(context)) }
+    var states by remember {
+        mutableStateOf(BlocklistRepository.states(context))
+    }
+    var updatingAll by remember { mutableStateOf(false) }
+    var updatingKind by remember { mutableStateOf<BlocklistRepository.Kind?>(null) }
+    var selected by remember { mutableStateOf<BlocklistRepository.Kind?>(null) }
+    var message by remember { mutableStateOf<String?>(null) }
+
+    fun reload() {
+        states = BlocklistRepository.states(context)
+    }
+
+    val selectedKind = selected
+    if (selectedKind != null) {
+        BackHandler { selected = null }
+        ListContentsScreen(
+            modifier = modifier,
+            kind = selectedKind,
+            onBack = { selected = null }
+        )
+        return
+    }
+
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 24.dp, vertical = 16.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = stringResource(R.string.blocklists_title),
+                style = MaterialTheme.typography.headlineSmall,
+                modifier = Modifier.weight(1f)
+            )
+            TextButton(onClick = onBack) {
+                Text(stringResource(R.string.blocklists_back))
+            }
+        }
+
+        SettingsSwitch(
+            text = stringResource(R.string.blocklists_autoupdate_all),
+            checked = autoAll,
+            onCheckedChange = {
+                autoAll = it
+                BlocklistRepository.setAutoUpdateEnabled(context, it)
+            }
+        )
+        Text(
+            text = stringResource(R.string.blocklists_autoupdate_all_hint),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+
+        for (state in states) {
+            Spacer(Modifier.height(16.dp))
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text = stringResource(kindTitle(state.kind)),
+                            style = MaterialTheme.typography.titleMedium,
+                            modifier = Modifier.weight(1f)
+                        )
+                        if (updatingKind == state.kind) {
+                            LinearProgressIndicator(modifier = Modifier.width(48.dp))
+                        }
+                    }
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        text = stringResource(
+                            R.string.blocklists_state,
+                            state.count,
+                            Formatter.formatShortFileSize(context, state.bytes),
+                            state.lastUpdated.takeIf { it > 0L }?.let {
+                                stringResource(
+                                    R.string.blocklists_updated_at,
+                                    SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault())
+                                        .format(Date(it))
+                                )
+                            } ?: stringResource(R.string.blocklists_never)
+                        ),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        text = stringResource(R.string.blocklists_source, state.url),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    SettingsSwitch(
+                        text = stringResource(R.string.blocklists_autoupdate),
+                        checked = state.autoUpdate,
+                        enabled = autoAll,
+                        onCheckedChange = {
+                            BlocklistRepository.setListAutoUpdateEnabled(context, state.kind, it)
+                            reload()
+                        }
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = {
+                                if (updatingKind != null) return@Button
+                                updatingKind = state.kind
+                                message = null
+                                scope.launch {
+                                    val result = withContext(Dispatchers.IO) {
+                                        BlocklistRepository.forceRefresh(context, state.kind)
+                                    }
+                                    updatingKind = null
+                                    reload()
+                                    message = context.getString(
+                                        when (result) {
+                                            BlocklistRepository.RefreshResult.SUCCESS ->
+                                                R.string.blocklists_update_done
+                                            BlocklistRepository.RefreshResult.NO_INTERNET ->
+                                                R.string.settings_update_blocklists_no_internet
+                                            BlocklistRepository.RefreshResult.FAILED ->
+                                                R.string.blocklists_update_failed
+                                        }
+                                    )
+                                }
+                            },
+                            enabled = !updatingAll && updatingKind == null
+                        ) {
+                            Text(stringResource(R.string.blocklists_update))
+                        }
+                        OutlinedButton(
+                            onClick = { selected = state.kind },
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Text(stringResource(R.string.blocklists_open))
+                        }
+                    }
+                }
+            }
+        }
+
+        Spacer(Modifier.height(16.dp))
+        Button(
+            onClick = {
+                if (updatingAll || updatingKind != null) return@Button
+                updatingAll = true
+                message = null
+                scope.launch {
+                    val failed = withContext(Dispatchers.IO) {
+                        BlocklistRepository.Kind.entries.count {
+                            BlocklistRepository.forceRefresh(context, it) !=
+                                BlocklistRepository.RefreshResult.SUCCESS
+                        }
+                    }
+                    updatingAll = false
+                    reload()
+                    message = context.getString(
+                        if (failed == 0) R.string.settings_update_blocklists_done
+                        else R.string.blocklists_update_failed
+                    )
+                }
+            },
+            enabled = !updatingAll && updatingKind == null,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text(stringResource(R.string.blocklists_update_all))
+        }
+        if (updatingAll) {
+            Spacer(Modifier.height(8.dp))
+            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+        }
+        message?.let {
+            Spacer(Modifier.height(8.dp))
+            Text(
+                text = it,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        Spacer(Modifier.height(24.dp))
+    }
+}
+
+private fun kindTitle(kind: BlocklistRepository.Kind): Int = when (kind) {
+    BlocklistRepository.Kind.TRACKERS -> R.string.blocklists_trackers
+    BlocklistRepository.Kind.ADS -> R.string.blocklists_ads
+}
+
+@Composable
+private fun ListContentsScreen(
+    modifier: Modifier = Modifier,
+    kind: BlocklistRepository.Kind,
+    onBack: () -> Unit
+) {
+    val context = LocalContext.current
+    var entries by remember(kind) { mutableStateOf<List<String>?>(null) }
+    var query by remember(kind) { mutableStateOf("") }
+
+    LaunchedEffect(kind) {
+        entries = withContext(Dispatchers.IO) {
+            BlocklistRepository.entries(context, kind)
+        }
+    }
+
+    val filtered = remember(entries, query) {
+        val all = entries ?: return@remember emptyList()
+        val needle = query.trim()
+        if (needle.isEmpty()) all else all.filter { it.contains(needle, ignoreCase = true) }
+    }
+
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .padding(horizontal = 24.dp, vertical = 16.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = stringResource(kindTitle(kind)),
+                style = MaterialTheme.typography.headlineSmall,
+                modifier = Modifier.weight(1f)
+            )
+            TextButton(onClick = onBack) {
+                Text(stringResource(R.string.blocklists_back))
+            }
+        }
+        Text(
+            text = stringResource(R.string.blocklists_entries, entries?.size ?: 0),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Spacer(Modifier.height(8.dp))
+        OutlinedTextField(
+            value = query,
+            onValueChange = { query = it },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            label = { Text(stringResource(R.string.blocklists_search)) }
+        )
+        Spacer(Modifier.height(8.dp))
+        when {
+            entries == null -> LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+            filtered.isEmpty() -> Text(
+                text = stringResource(
+                    if (query.isBlank()) R.string.blocklists_empty
+                    else R.string.blocklists_not_found
+                ),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(vertical = 16.dp)
+            )
+            else -> LazyColumn(modifier = Modifier.weight(1f)) {
+                items(filtered) { entry ->
+                    Text(
+                        text = entry,
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 4.dp)
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -1968,7 +2326,12 @@ private fun LabelAvatar(domain: String, size: Dp) {
 }
 
 @Composable
-private fun SettingsSwitch(text: String, checked: Boolean, onCheckedChange: (Boolean) -> Unit) {
+private fun SettingsSwitch(
+    text: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+    enabled: Boolean = true
+) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -1978,9 +2341,11 @@ private fun SettingsSwitch(text: String, checked: Boolean, onCheckedChange: (Boo
         Text(
             text = text,
             style = MaterialTheme.typography.bodyLarge,
-            modifier = Modifier.weight(1f)
+            modifier = Modifier.weight(1f),
+            color = if (enabled) MaterialTheme.colorScheme.onSurface
+            else MaterialTheme.colorScheme.onSurfaceVariant
         )
-        Switch(checked = checked, onCheckedChange = onCheckedChange)
+        Switch(checked = checked, onCheckedChange = onCheckedChange, enabled = enabled)
     }
 }
 
