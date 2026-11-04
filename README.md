@@ -1,5 +1,7 @@
 # AntiTrack
 
+![Downloads](https://img.shields.io/github/downloads/CherretGit/zaprett-app/total)
+
 Локальный блокировщик трекеров и рекламы для Android. Работает через собственный
 VPN-сервис, который фильтрует DNS-запросы на устройстве: трафик приложений не
 уходит на сторонние серверы, root не нужен.
