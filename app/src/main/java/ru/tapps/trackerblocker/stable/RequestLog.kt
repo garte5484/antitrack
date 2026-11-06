@@ -17,6 +17,12 @@ object RequestLog {
 
     enum class Status { ALLOWED, TRACKER, ADS, THROTTLE, CUSTOM_BLOCKED }
 
+    /**
+     * Почему запись попала в «Другое» или почему приложение определено
+     * приблизительно. Показывается в деталях лога, чтобы не гадать.
+     */
+    enum class Reason { UID_UNKNOWN, SYSTEM_RESOLVER, DB_MISATTRIBUTION }
+
     data class Entry(
         val id: Long,
         val timeMs: Long,
@@ -25,7 +31,8 @@ object RequestLog {
         val status: Status,
         val srcIp: String? = null,
         val dstIp: String? = null,
-        val matchPattern: String? = null
+        val matchPattern: String? = null,
+        val reason: Reason? = null
     )
 
     private const val PREF_NAME = "request_log"
@@ -63,7 +70,8 @@ object RequestLog {
         status: Status,
         srcIp: String? = null,
         dstIp: String? = null,
-        matchPattern: String? = null
+        matchPattern: String? = null,
+        reason: Reason? = null
     ) {
         if (!isEnabled) return
         synchronized(lock) {
@@ -76,7 +84,8 @@ object RequestLog {
                 status = status,
                 srcIp = srcIp,
                 dstIp = dstIp,
-                matchPattern = matchPattern
+                matchPattern = matchPattern,
+                reason = reason
             )
             state.value = (listOf(entry) + state.value).take(MAX_ENTRIES)
         }

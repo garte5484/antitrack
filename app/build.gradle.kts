@@ -24,10 +24,35 @@ android {
         applicationId = "ru.tapps.trackerblocker.stable"
         minSdk = 24
         targetSdk = 37
-        versionCode = 6
-        versionName = "1.4"
+        versionCode = 7
+        versionName = "1.5"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // Userspace-стек для режима полного туннеля.
+        ndkVersion = "27.0.12077973"
+        externalNativeBuild {
+            cmake {
+                arguments += "-DANDROID_PLATFORM=android-24"
+            }
+        }
+        ndk {
+            abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+        }
+    }
+
+    packaging {
+        jniLibs {
+            // Нативные библиотеки должны распаковываться из APK на старых
+            // прошивках; для 16 КБ страниц это не требуется, но не мешает.
+            useLegacyPackaging = true
+        }
     }
 
     signingConfigs {

@@ -154,6 +154,7 @@ class MainActivity : ComponentActivity() {
         PerAppSettings.init(this)
         RequestLog.init(this)
         HostRules.init(this)
+        AppTrackerMap.init(this)
         requestNotificationPermissionIfNeeded()
         lifecycleScope.launch {
             withContext(Dispatchers.IO) {
@@ -740,6 +741,7 @@ fun AntiTrackScreen(
                     AppSettings.setBlockAds(it)
                     applyServiceSettings()
                 },
+                onBlockModeChange = applyServiceSettings,
                 onExclusionsChanged = applyServiceSettings,
                 onOpenRules = { showRules = true },
                 onOpenBlocklists = { showBlocklists = true },
@@ -809,6 +811,16 @@ fun AntiTrackScreen(
         /** Мало блокировок: меньше 30 или меньше 15% от всех на вкладке. */
         fun isLowConfidence(count: Long): Boolean =
             count < 30L || count.toDouble() < rowsTotal * 0.15
+
+        /**
+         * Строка требует звёздочки «возможно ошибочное определение», только
+         * если пара «приложение ↔ трекер» не подтверждена встроенной базой.
+         */
+        fun isUnconfirmed(name: String, count: Long, host: String): Boolean =
+            dialogApp != BlockStats.OTHER &&
+                !isMetaBrand(name) &&
+                isLowConfidence(count) &&
+                !AppTrackerMap.isKnownInApp(dialogApp, host)
 
         var blockTrackersForApp by remember(dialogApp) { mutableStateOf(PerAppSettings.isTrackerBlockingEnabled(dialogApp)) }
         ModalBottomSheet(
@@ -886,15 +898,26 @@ fun AntiTrackScreen(
                             ) {
                                 LabelAvatar(domain = host, size = 32.dp)
                                 Spacer(Modifier.width(12.dp))
-                                Text(
-                                    text = when {
-                                        isMetaBrand(name) -> "$name**"
-                                        dialogApp != BlockStats.OTHER && isLowConfidence(count) -> "$name*"
-                                        else -> name
-                                    },
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    modifier = Modifier.weight(1f)
-                                )
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = when {
+                                            isMetaBrand(name) -> "$name**"
+                                            isUnconfirmed(name, count, host) -> "$name*"
+                                            else -> name
+                                        },
+                                        style = MaterialTheme.typography.bodyMedium
+                                    )
+                                    // Сырой домен: по бренду не всегда понятно,
+                                    // какой именно хост заблокирован (например,
+                                    // «Google» — это Firebase, FCM или аналитика).
+                                    Text(
+                                        text = host,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
 
                                 Spacer(Modifier.width(8.dp))
                                 Text(
@@ -906,8 +929,19 @@ fun AntiTrackScreen(
                     }
                 }
                 Spacer(Modifier.height(12.dp))
+                if (dialogApp == BlockStats.OTHER && rows.isNotEmpty()) {
+                    Text(
+                        text = stringResource(R.string.stats_other_note),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(24.dp),
+                        textAlign = TextAlign.Center
+                    )
+                }
                 if (dialogApp != BlockStats.OTHER &&
-                    rows.any { !isMetaBrand(it.first) && isLowConfidence(it.second) }
+                    rows.any { isUnconfirmed(it.first, it.second, it.third) }
                 ) {
                     Text(
                         text = stringResource(R.string.stats_possible_misattribution),
@@ -1255,6 +1289,20 @@ private fun LogsScreen(modifier: Modifier = Modifier) {
                     )
                     DetailRow(stringResource(R.string.logs_details_status), statusText)
                     DetailRow(stringResource(R.string.logs_details_pattern), patternText)
+                    val reason = entry.reason
+                    if (reason != null) {
+                        DetailRow(
+                            stringResource(R.string.logs_details_reason),
+                            when (reason) {
+                                RequestLog.Reason.UID_UNKNOWN ->
+                                    stringResource(R.string.logs_reason_uid_unknown)
+                                RequestLog.Reason.SYSTEM_RESOLVER ->
+                                    stringResource(R.string.logs_reason_system_resolver)
+                                RequestLog.Reason.DB_MISATTRIBUTION ->
+                                    stringResource(R.string.logs_reason_db_misattribution)
+                            }
+                        )
+                    }
                 }
             },
             confirmButton = {
@@ -1357,6 +1405,7 @@ private fun SettingsScreen(
     usageAccess: Boolean,
     onBlockTrackersChange: (Boolean) -> Unit,
     onBlockAdsChange: (Boolean) -> Unit,
+    onBlockModeChange: () -> Unit,
     onExclusionsChanged: () -> Unit,
     onOpenRules: () -> Unit,
     onOpenBlocklists: () -> Unit,
@@ -1367,6 +1416,8 @@ private fun SettingsScreen(
     var message by remember { mutableStateOf<String?>(null) }
     var lastUpdated by remember { mutableStateOf(BlocklistRepository.lastUpdated(context)) }
     var excluded by remember { mutableStateOf(PerAppSettings.disabledTrackerPackages()) }
+    var blockMode by remember { mutableStateOf(AppSettings.blockMode()) }
+    var tunnelStrictIp by remember { mutableStateOf(AppSettings.tunnelStrictIp()) }
     var dnsProviderId by remember { mutableStateOf(AppSettings.dnsProviderId()) }
     var customDns by remember { mutableStateOf(AppSettings.customDnsRaw()) }
     var dnsEncrypt by remember { mutableStateOf(AppSettings.dnsEncryptionEnabled()) }
@@ -1418,6 +1469,8 @@ private fun SettingsScreen(
                 customDns = AppSettings.customDnsRaw()
                 dnsEncrypt = AppSettings.dnsEncryptionEnabled()
                 blockNull = AppSettings.blockWithNullAddress()
+                blockMode = AppSettings.blockMode()
+                tunnelStrictIp = AppSettings.tunnelStrictIp()
                 excluded = PerAppSettings.disabledTrackerPackages()
                 lastUpdated = BlocklistRepository.lastUpdated(context)
                 onSettingsImported()
@@ -1485,7 +1538,81 @@ private fun SettingsScreen(
         )
 
         Spacer(Modifier.height(20.dp))
+        SectionTitle(stringResource(R.string.settings_section_block_mode))
+        SettingsRadioRow(
+            text = stringResource(R.string.settings_mode_dns),
+            selected = blockMode == AppSettings.MODE_DNS,
+            onClick = {
+                if (blockMode != AppSettings.MODE_DNS) {
+                    blockMode = AppSettings.MODE_DNS
+                    AppSettings.setBlockMode(AppSettings.MODE_DNS)
+                    onBlockModeChange()
+                }
+            }
+        )
+        Text(
+            text = stringResource(R.string.settings_mode_dns_hint),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Spacer(Modifier.height(8.dp))
+        SettingsRadioRow(
+            text = stringResource(R.string.settings_mode_tunnel),
+            selected = blockMode == AppSettings.MODE_TUNNEL,
+            onClick = {
+                if (blockMode != AppSettings.MODE_TUNNEL) {
+                    blockMode = AppSettings.MODE_TUNNEL
+                    AppSettings.setBlockMode(AppSettings.MODE_TUNNEL)
+                    onBlockModeChange()
+                }
+            }
+        )
+        Text(
+            text = stringResource(R.string.settings_mode_tunnel_hint),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        if (blockMode == AppSettings.MODE_TUNNEL) {
+            Spacer(Modifier.height(8.dp))
+            SettingsSwitch(
+                text = stringResource(R.string.settings_tunnel_strict_ip),
+                checked = tunnelStrictIp,
+                onCheckedChange = {
+                    tunnelStrictIp = it
+                    AppSettings.setTunnelStrictIp(it)
+                }
+            )
+            Text(
+                text = stringResource(R.string.settings_tunnel_strict_ip_hint),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        Spacer(Modifier.height(4.dp))
+        Text(
+            text = stringResource(R.string.settings_block_mode_restart_hint),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        if (blockMode == AppSettings.MODE_TUNNEL && BlockVpnService.tunnelUnavailable) {
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = stringResource(R.string.settings_tunnel_unavailable),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error
+            )
+        }
+
+        Spacer(Modifier.height(20.dp))
         SectionTitle(stringResource(R.string.settings_section_dns))
+        if (blockMode == AppSettings.MODE_TUNNEL) {
+            Text(
+                text = stringResource(R.string.settings_tunnel_dns_note),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error
+            )
+            Spacer(Modifier.height(4.dp))
+        }
         Text(
             text = stringResource(R.string.settings_dns_hint),
             style = MaterialTheme.typography.bodySmall,
@@ -1802,6 +1929,7 @@ private fun BlocklistsScreen(
     var updatingKind by remember { mutableStateOf<BlocklistRepository.Kind?>(null) }
     var selected by remember { mutableStateOf<BlocklistRepository.Kind?>(null) }
     var message by remember { mutableStateOf<String?>(null) }
+    var section by remember { mutableStateOf(0) }
 
     fun reload() {
         states = BlocklistRepository.states(context)
@@ -1821,7 +1949,6 @@ private fun BlocklistsScreen(
     Column(
         modifier = modifier
             .fillMaxSize()
-            .verticalScroll(rememberScrollState())
             .padding(horizontal = 24.dp, vertical = 16.dp)
     ) {
         Row(
@@ -1838,147 +1965,403 @@ private fun BlocklistsScreen(
             }
         }
 
-        SettingsSwitch(
-            text = stringResource(R.string.blocklists_autoupdate_all),
-            checked = autoAll,
-            onCheckedChange = {
-                autoAll = it
-                BlocklistRepository.setAutoUpdateEnabled(context, it)
+        TabRow(selectedTabIndex = section) {
+            Tab(
+                selected = section == 0,
+                onClick = { section = 0 },
+                text = { Text(stringResource(R.string.blocklists_tab_lists)) }
+            )
+            Tab(
+                selected = section == 1,
+                onClick = { section = 1 },
+                text = { Text(stringResource(R.string.blocklists_tab_links)) }
+            )
+        }
+
+        if (section == 0) {
+            Column(
+                modifier = Modifier
+                    .weight(1f)
+                    .verticalScroll(rememberScrollState())
+            ) {
+                Spacer(Modifier.height(8.dp))
+                SettingsSwitch(
+                    text = stringResource(R.string.blocklists_autoupdate_all),
+                    checked = autoAll,
+                    onCheckedChange = {
+                        autoAll = it
+                        BlocklistRepository.setAutoUpdateEnabled(context, it)
+                    }
+                )
+                Text(
+                    text = stringResource(R.string.blocklists_autoupdate_all_hint),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                for (state in states) {
+                    Spacer(Modifier.height(16.dp))
+                    Card(modifier = Modifier.fillMaxWidth()) {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    text = stringResource(kindTitle(state.kind)),
+                                    style = MaterialTheme.typography.titleMedium,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                if (updatingKind == state.kind) {
+                                    LinearProgressIndicator(modifier = Modifier.width(48.dp))
+                                }
+                            }
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                text = stringResource(
+                                    R.string.blocklists_state,
+                                    state.count,
+                                    Formatter.formatShortFileSize(context, state.bytes),
+                                    state.lastUpdated.takeIf { it > 0L }?.let {
+                                        stringResource(
+                                            R.string.blocklists_updated_at,
+                                            SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault())
+                                                .format(Date(it))
+                                        )
+                                    } ?: stringResource(R.string.blocklists_never)
+                                ),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Spacer(Modifier.height(4.dp))
+                            Text(
+                                text = stringResource(R.string.blocklists_source, state.url),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                            Spacer(Modifier.height(8.dp))
+                            SettingsSwitch(
+                                text = stringResource(R.string.blocklists_autoupdate),
+                                checked = state.autoUpdate,
+                                enabled = autoAll,
+                                onCheckedChange = {
+                                    BlocklistRepository.setListAutoUpdateEnabled(
+                                        context,
+                                        state.kind,
+                                        it
+                                    )
+                                    reload()
+                                }
+                            )
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Button(
+                                    onClick = {
+                                        if (updatingKind != null) return@Button
+                                        updatingKind = state.kind
+                                        message = null
+                                        scope.launch {
+                                            val result = withContext(Dispatchers.IO) {
+                                                BlocklistRepository.forceRefresh(context, state.kind)
+                                            }
+                                            updatingKind = null
+                                            reload()
+                                            message = context.getString(
+                                                when (result) {
+                                                    BlocklistRepository.RefreshResult.SUCCESS ->
+                                                        R.string.blocklists_update_done
+                                                    BlocklistRepository.RefreshResult.NO_INTERNET ->
+                                                        R.string.settings_update_blocklists_no_internet
+                                                    BlocklistRepository.RefreshResult.FAILED ->
+                                                        R.string.blocklists_update_failed
+                                                }
+                                            )
+                                        }
+                                    },
+                                    enabled = !updatingAll && updatingKind == null
+                                ) {
+                                    Text(stringResource(R.string.blocklists_update))
+                                }
+                                OutlinedButton(
+                                    onClick = { selected = state.kind },
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    Text(stringResource(R.string.blocklists_open))
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(16.dp))
+                Button(
+                    onClick = {
+                        if (updatingAll || updatingKind != null) return@Button
+                        updatingAll = true
+                        message = null
+                        scope.launch {
+                            val failed = withContext(Dispatchers.IO) {
+                                BlocklistRepository.Kind.entries.count {
+                                    BlocklistRepository.forceRefresh(context, it) !=
+                                        BlocklistRepository.RefreshResult.SUCCESS
+                                }
+                            }
+                            updatingAll = false
+                            reload()
+                            message = context.getString(
+                                if (failed == 0) R.string.settings_update_blocklists_done
+                                else R.string.blocklists_update_failed
+                            )
+                        }
+                    },
+                    enabled = !updatingAll && updatingKind == null,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(stringResource(R.string.blocklists_update_all))
+                }
+                if (updatingAll) {
+                    Spacer(Modifier.height(8.dp))
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                }
+                message?.let {
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        text = it,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Spacer(Modifier.height(24.dp))
             }
-        )
+        } else {
+            AppTrackerLinksSection(
+                modifier = Modifier.weight(1f),
+                context = context
+            )
+        }
+    }
+}
+
+@Composable
+private fun AppTrackerLinksSection(
+    modifier: Modifier = Modifier,
+    context: Context
+) {
+    var byTracker by remember { mutableStateOf(false) }
+    var query by remember { mutableStateOf("") }
+    val apps = remember { AppTrackerMap.apps() }
+    val links = remember { AppTrackerMap.links() }
+    val appNames = remember(apps) {
+        apps.associate { it.packageName to AppTrackerMap.displayName(context, it) }
+    }
+    val needle = query.trim()
+
+    /** Имя приложения для строки связей. */
+    fun appName(entry: AppTrackerMap.AppEntry): String =
+        appNames[entry.packageName] ?: entry.label ?: entry.packageName
+
+    Column(modifier.fillMaxSize()) {
+        Spacer(Modifier.height(8.dp))
         Text(
-            text = stringResource(R.string.blocklists_autoupdate_all_hint),
+            text = stringResource(R.string.links_hint),
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant
         )
+        if (AppTrackerMap.version > 0) {
+            Spacer(Modifier.height(2.dp))
+            Text(
+                text = stringResource(R.string.links_source, AppTrackerMap.version),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        Spacer(Modifier.height(8.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            FilterChip(
+                selected = !byTracker,
+                onClick = { byTracker = false },
+                label = { Text(stringResource(R.string.links_by_app)) }
+            )
+            FilterChip(
+                selected = byTracker,
+                onClick = { byTracker = true },
+                label = { Text(stringResource(R.string.links_by_tracker)) }
+            )
+        }
+        Spacer(Modifier.height(8.dp))
+        OutlinedTextField(
+            value = query,
+            onValueChange = { query = it },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            label = {
+                Text(
+                    stringResource(
+                        if (byTracker) R.string.links_search_tracker
+                        else R.string.links_search_app
+                    )
+                )
+            }
+        )
+        Spacer(Modifier.height(8.dp))
 
-        for (state in states) {
-            Spacer(Modifier.height(16.dp))
-            Card(modifier = Modifier.fillMaxWidth()) {
-                Column(modifier = Modifier.padding(16.dp)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(
-                            text = stringResource(kindTitle(state.kind)),
-                            style = MaterialTheme.typography.titleMedium,
-                            modifier = Modifier.weight(1f)
-                        )
-                        if (updatingKind == state.kind) {
-                            LinearProgressIndicator(modifier = Modifier.width(48.dp))
+        when {
+            apps.isEmpty() -> Text(
+                text = stringResource(R.string.links_empty),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(vertical = 16.dp)
+            )
+            byTracker -> {
+                val filtered = links.filter { link ->
+                    needle.isEmpty() ||
+                        link.domain.contains(needle, ignoreCase = true) ||
+                        link.apps.any {
+                            appName(it).contains(needle, ignoreCase = true) ||
+                                it.packageName.contains(needle, ignoreCase = true)
+                        }
+                }
+                if (filtered.isEmpty()) {
+                    Text(
+                        text = stringResource(R.string.links_not_found),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(vertical = 16.dp)
+                    )
+                } else {
+                    LazyColumn(
+                        modifier = Modifier.weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        items(filtered, key = { "${it.isCompany}:${it.domain}" }) { link ->
+                            TrackerLinkCard(
+                                link = link,
+                                appName = { appName(it) }
+                            )
                         }
                     }
-                    Spacer(Modifier.height(4.dp))
+                }
+            }
+            else -> {
+                val filtered = apps.filter { app ->
+                    needle.isEmpty() ||
+                        appName(app).contains(needle, ignoreCase = true) ||
+                        app.packageName.contains(needle, ignoreCase = true)
+                }
+                if (filtered.isEmpty()) {
                     Text(
-                        text = stringResource(
-                            R.string.blocklists_state,
-                            state.count,
-                            Formatter.formatShortFileSize(context, state.bytes),
-                            state.lastUpdated.takeIf { it > 0L }?.let {
-                                stringResource(
-                                    R.string.blocklists_updated_at,
-                                    SimpleDateFormat("dd.MM.yyyy HH:mm", Locale.getDefault())
-                                        .format(Date(it))
-                                )
-                            } ?: stringResource(R.string.blocklists_never)
-                        ),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    Spacer(Modifier.height(4.dp))
-                    Text(
-                        text = stringResource(R.string.blocklists_source, state.url),
-                        style = MaterialTheme.typography.bodySmall,
+                        text = stringResource(R.string.links_not_found),
+                        style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
+                        modifier = Modifier.padding(vertical = 16.dp)
                     )
-                    Spacer(Modifier.height(8.dp))
-                    SettingsSwitch(
-                        text = stringResource(R.string.blocklists_autoupdate),
-                        checked = state.autoUpdate,
-                        enabled = autoAll,
-                        onCheckedChange = {
-                            BlocklistRepository.setListAutoUpdateEnabled(context, state.kind, it)
-                            reload()
-                        }
-                    )
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(
-                            onClick = {
-                                if (updatingKind != null) return@Button
-                                updatingKind = state.kind
-                                message = null
-                                scope.launch {
-                                    val result = withContext(Dispatchers.IO) {
-                                        BlocklistRepository.forceRefresh(context, state.kind)
-                                    }
-                                    updatingKind = null
-                                    reload()
-                                    message = context.getString(
-                                        when (result) {
-                                            BlocklistRepository.RefreshResult.SUCCESS ->
-                                                R.string.blocklists_update_done
-                                            BlocklistRepository.RefreshResult.NO_INTERNET ->
-                                                R.string.settings_update_blocklists_no_internet
-                                            BlocklistRepository.RefreshResult.FAILED ->
-                                                R.string.blocklists_update_failed
-                                        }
-                                    )
-                                }
-                            },
-                            enabled = !updatingAll && updatingKind == null
-                        ) {
-                            Text(stringResource(R.string.blocklists_update))
-                        }
-                        OutlinedButton(
-                            onClick = { selected = state.kind },
-                            modifier = Modifier.weight(1f)
-                        ) {
-                            Text(stringResource(R.string.blocklists_open))
+                } else {
+                    LazyColumn(
+                        modifier = Modifier.weight(1f),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        items(filtered, key = { it.packageName }) { app ->
+                            AppLinkCard(app = app, name = appName(app))
                         }
                     }
                 }
             }
         }
+    }
+}
 
-        Spacer(Modifier.height(16.dp))
-        Button(
-            onClick = {
-                if (updatingAll || updatingKind != null) return@Button
-                updatingAll = true
-                message = null
-                scope.launch {
-                    val failed = withContext(Dispatchers.IO) {
-                        BlocklistRepository.Kind.entries.count {
-                            BlocklistRepository.forceRefresh(context, it) !=
-                                BlocklistRepository.RefreshResult.SUCCESS
-                        }
-                    }
-                    updatingAll = false
-                    reload()
-                    message = context.getString(
-                        if (failed == 0) R.string.settings_update_blocklists_done
-                        else R.string.blocklists_update_failed
-                    )
-                }
-            },
-            enabled = !updatingAll && updatingKind == null,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Text(stringResource(R.string.blocklists_update_all))
-        }
-        if (updatingAll) {
-            Spacer(Modifier.height(8.dp))
-            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-        }
-        message?.let {
-            Spacer(Modifier.height(8.dp))
+@Composable
+private fun AppLinkCard(app: AppTrackerMap.AppEntry, name: String) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            Text(text = name, style = MaterialTheme.typography.titleMedium)
             Text(
-                text = it,
-                style = MaterialTheme.typography.bodyMedium,
+                text = app.packageName,
+                style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
+            Spacer(Modifier.height(4.dp))
+            Text(
+                text = stringResource(
+                    if (app.complete) R.string.links_complete else R.string.links_incomplete
+                ),
+                style = MaterialTheme.typography.labelMedium,
+                color = if (app.complete) MaterialTheme.colorScheme.primary
+                else MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Spacer(Modifier.height(4.dp))
+            val companies = AppTrackerMap.companiesForApp(app.packageName)
+            val companyLabel = stringResource(R.string.links_company)
+            if (app.trackers.isEmpty() && companies.isEmpty()) {
+                Text(
+                    text = stringResource(
+                        if (app.complete) R.string.links_no_trackers
+                        else R.string.links_no_known
+                    ),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            } else {
+                for (tracker in app.trackers.sorted()) {
+                    Text(
+                        text = "• ${BrandNames.displayName(tracker)} · $tracker",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+                for (company in companies) {
+                    Text(
+                        text = "• ${company.name} · $companyLabel",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+            }
         }
-        Spacer(Modifier.height(24.dp))
+    }
+}
+
+@Composable
+private fun TrackerLinkCard(
+    link: AppTrackerMap.TrackerLink,
+    appName: (AppTrackerMap.AppEntry) -> String
+) {
+    Card(modifier = Modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                LabelAvatar(domain = link.domain, size = 28.dp)
+                Spacer(Modifier.width(8.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = if (link.isCompany) link.domain
+                        else BrandNames.displayName(link.domain),
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                    Text(
+                        text = if (link.isCompany) stringResource(R.string.links_company)
+                        else link.domain,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Text(
+                    text = stringResource(R.string.links_apps_count, link.apps.size),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+            if (link.exclusive) {
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    text = stringResource(R.string.links_exclusive),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.primary
+                )
+            }
+            Spacer(Modifier.height(4.dp))
+            for (app in link.apps) {
+                Text(
+                    text = "• ${appName(app)} (${app.packageName})",
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+        }
     }
 }
 

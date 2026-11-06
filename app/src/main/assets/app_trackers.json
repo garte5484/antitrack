@@ -1,0 +1,189 @@
+{
+  "version": 1,
+  "description": "Встроенная база связей «трекер ↔ приложение». complete=true означает, что список трекеров приложения полный: другие трекеры, приписанные ему, уходят в статистику «Другое». exclusiveTrackers — домены, которые встречаются только в перечисленных приложениях.",
+  "apps": [
+    {
+      "package": "ru.tapps.trackerblocker.stable",
+      "label": "AntiTrack",
+      "complete": true,
+      "trackers": []
+    },
+    {
+      "package": "org.telegram.messenger",
+      "label": "Telegram",
+      "complete": true,
+      "trackers": []
+    },
+    {
+      "package": "org.thoughtcrime.securesms",
+      "label": "Signal",
+      "complete": true,
+      "trackers": []
+    },
+    {
+      "package": "com.google.android.youtube",
+      "label": "YouTube",
+      "complete": false,
+      "trackers": [
+        "google-analytics.com",
+        "googletagmanager.com",
+        "googlesyndication.com",
+        "doubleclick.net",
+        "googleadservices.com"
+      ]
+    },
+    {
+      "package": "com.google.android.apps.youtube.music",
+      "label": "YouTube Music",
+      "complete": false,
+      "trackers": [
+        "google-analytics.com",
+        "googlesyndication.com",
+        "doubleclick.net"
+      ]
+    },
+    {
+      "package": "com.instagram.android",
+      "label": "Instagram",
+      "complete": false,
+      "trackers": [
+        "facebook.com",
+        "fbcdn.net",
+        "instagram.com"
+      ]
+    },
+    {
+      "package": "com.facebook.katana",
+      "label": "Facebook",
+      "complete": false,
+      "trackers": [
+        "facebook.com",
+        "fbcdn.net"
+      ]
+    },
+    {
+      "package": "com.whatsapp",
+      "label": "WhatsApp",
+      "complete": false,
+      "trackers": [
+        "facebook.com",
+        "graph.facebook.com"
+      ]
+    },
+    {
+      "package": "com.vkontakte.android",
+      "label": "VK",
+      "complete": false,
+      "trackers": [
+        "vk.com",
+        "userapi.com",
+        "mail.ru"
+      ]
+    },
+    {
+      "package": "ru.yandex.music",
+      "label": "Яндекс Музыка",
+      "complete": false,
+      "trackers": [
+        "appmetrica.yandex.net",
+        "yandex.ru",
+        "yastatic.net"
+      ]
+    },
+    {
+      "package": "ru.yandex.taxi",
+      "label": "Яндекс Go",
+      "complete": false,
+      "trackers": [
+        "appmetrica.yandex.net",
+        "yandex.ru",
+        "yastatic.net"
+      ]
+    },
+    {
+      "package": "com.spotify.music",
+      "label": "Spotify",
+      "complete": false,
+      "trackers": [
+        "facebook.com",
+        "app-measurement.com",
+        "crashlytics.com"
+      ]
+    },
+    {
+      "package": "com.zhiliaoapp.musically",
+      "label": "TikTok",
+      "complete": false,
+      "trackers": [
+        "facebook.com",
+        "app-measurement.com",
+        "appsflyer.com"
+      ]
+    },
+    {
+      "package": "com.snapchat.android",
+      "label": "Snapchat",
+      "complete": false,
+      "trackers": [
+        "facebook.com",
+        "appsflyer.com",
+        "app-measurement.com"
+      ]
+    },
+
+    {
+      "package": "com.google.android.gsf",
+      "label": "Google Services Framework",
+      "complete": true,
+      "trackers": [
+        "googleapis.com",
+        "google-analytics.com",
+        "app-measurement.com",
+        "crashlytics.com",
+        "google.com",
+        "doubleclick.net"
+      ]
+    },
+    {
+      "package": "com.android.vending",
+      "label": "Google Play",
+      "complete": true,
+      "trackers": [
+        "googleapis.com",
+        "google-analytics.com",
+        "app-measurement.com",
+        "crashlytics.com",
+        "google.com",
+        "doubleclick.net"
+      ]
+    },
+    {
+      "package": "com.google.android.gms",
+      "label": "Сервисы Google Play",
+      "complete": true,
+      "trackers": [
+        "googleapis.com",
+        "google-analytics.com",
+        "app-measurement.com",
+        "crashlytics.com",
+        "google.com",
+        "doubleclick.net"
+      ]
+    }
+  ],
+  "companies": [
+    {
+      "company": "heytap",
+      "exclusive": true,
+      "apps": [
+        "com.heytap.market",
+        "com.heytap.colorfulengine",
+        "com.heytap.mcs",
+        "com.heytap.browser",
+        "com.heytap.accessory",
+        "com.heytap.music",
+        "com.heytap.pictorial"
+      ]
+    }
+  ]
+}

@@ -26,6 +26,12 @@ import android.system.ErrnoException
 import android.system.Os
 import android.system.OsConstants
 import android.util.Log
+import androidx.annotation.Keep
+import ru.tapps.trackerblocker.stable.tunnel.Allowed
+import ru.tapps.trackerblocker.stable.tunnel.Packet
+import ru.tapps.trackerblocker.stable.tunnel.ResourceRecord
+import ru.tapps.trackerblocker.stable.tunnel.TunnelDnsTable
+import ru.tapps.trackerblocker.stable.tunnel.Usage
 import java.io.File
 import java.io.IOException
 import java.net.InetAddress
@@ -61,6 +67,34 @@ import java.util.concurrent.atomic.AtomicLong
  * это и есть гибридный режим «TCP напрямую».
  */
 class BlockVpnService : VpnService() {
+
+    // ————————————— режим полного туннеля (userspace-стек) —————————————
+
+    /** Контекст нативного стека; 0 — стек не запущен. */
+    @Volatile
+    private var nativeContext = 0L
+
+    @Volatile
+    private var nativeThread: Thread? = null
+
+    /** Нативная библиотека загружена; ошибка загрузки логируется один раз. */
+    @Volatile
+    private var nativeLoaded = false
+
+    /** Таблица «IP → домены», собранная из DNS-ответов нативного стека. */
+    private val tunnelDns = TunnelDnsTable()
+
+    /** Режим, с которым построен текущий туннель. */
+    @Volatile
+    private var appliedMode: String = AppSettings.MODE_DNS
+
+    private external fun jniInit(sdk: Int): Long
+    private external fun jniStart(context: Long, logLevel: Int)
+    private external fun jniRun(context: Long, tun: Int, fwd53: Boolean, rcode: Int)
+    private external fun jniStop(context: Long)
+    private external fun jniClear(context: Long)
+    private external fun jniDone(context: Long)
+    private external fun jniGetMtu(): Int
 
     private var tunnel: ParcelFileDescriptor? = null
     private var tunnelWriter: java.io.FileDescriptor? = null
@@ -290,6 +324,11 @@ class BlockVpnService : VpnService() {
          * укладываются в классический лимит UDP.
          */
         private const val MTU = 4096
+        /** MTU полного туннеля: нативный стек рассчитан на 10000 (как NetGuard). */
+        private const val TUNNEL_MTU = 10000
+        private const val TUNNEL_RCODE = 3
+        /** Сколько держать соответствие «домен → IP», полученное из SNI. */
+        private const val SNI_MAPPING_TTL_SEC = 300
         private const val DNS_TIMEOUT_MS = 2000
         private const val DNS_DOT_TIMEOUT_MS = 4000
         /** TTL кеша, когда в ответе нет записей или его не удалось разобрать. */
@@ -402,6 +441,15 @@ class BlockVpnService : VpnService() {
         var isRunning = false
             private set
 
+        /**
+         * Полный туннель выбран, но нативный стек не загрузился, и сервис
+         * работает в DNS-режиме. UI показывает предупреждение, иначе
+         * пользователь думает, что включён точный режим.
+         */
+        @Volatile
+        var tunnelUnavailable = false
+            private set
+
         val blockedCount = AtomicLong(0)
 
         /**
@@ -438,6 +486,7 @@ class BlockVpnService : VpnService() {
         PerAppSettings.init(this)
         RequestLog.init(this)
         HostRules.init(this)
+        AppTrackerMap.init(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -482,11 +531,17 @@ class BlockVpnService : VpnService() {
                 return START_STICKY
             }
             ACTION_REFRESH -> {
-                // Настройки изменились. Если состав исключённых приложений другой,
-                // пересоздаём туннель: addDisallowedApplication применяется только
-                // в момент establish().
-                if (running && excludedPackages() != appliedExcludedPackages) {
-                    Log.i(TAG, "Состав исключённых приложений изменился — пересоздаю туннель")
+                // Настройки изменились. Если состав исключённых приложений или
+                // режим блокировки другие, пересоздаём туннель: и то и другое
+                // применяется только в момент establish().
+                val modeChanged = AppSettings.blockMode() != appliedMode
+                if (running && (excludedPackages() != appliedExcludedPackages || modeChanged)) {
+                    Log.i(
+                        TAG,
+                        "Настройки VPN изменились" +
+                            " (режим: ${AppSettings.blockMode()}, был $appliedMode)" +
+                            " — пересоздаю туннель"
+                    )
                     teardown()
                     // Слот только что был наш: не путаем собственную
                     // закрывающуюся сеть с чужим VPN.
@@ -528,6 +583,7 @@ class BlockVpnService : VpnService() {
         notifyHandler.removeCallbacks(pauseEndRunnable)
         BlockStats.flush()
         teardown()
+        destroyNativeContext()
         super.onDestroy()
     }
 
@@ -599,14 +655,20 @@ class BlockVpnService : VpnService() {
             blockedCount.set(0)
             dnsCache.clear()
             rebuildUidCache()
-            refreshSystemDns()
-            startNetworkMonitor()
-            relayPool = Executors.newFixedThreadPool(8)
-            if (ATTRIBUTION_DIAGNOSTICS) {
-                diagnosticsPool = Executors.newSingleThreadExecutor()
-                Log.i(TAG, "Диагностика атрибуции ВКЛЮЧЕНА")
+            if (appliedMode == AppSettings.MODE_TUNNEL) {
+                // Весь трафик обслуживает нативный userspace-стек: он сам
+                // определяет UID соединения и решает, пропускать ли поток.
+                startNativeStack(tun)
+            } else {
+                refreshSystemDns()
+                startNetworkMonitor()
+                relayPool = Executors.newFixedThreadPool(8)
+                if (ATTRIBUTION_DIAGNOSTICS) {
+                    diagnosticsPool = Executors.newSingleThreadExecutor()
+                    Log.i(TAG, "Диагностика атрибуции ВКЛЮЧЕНА")
+                }
             }
-            Log.i(TAG, "VPN запущен: fd=" + tun.fileDescriptor)
+            Log.i(TAG, "VPN запущен: режим=$appliedMode fd=${tun.fileDescriptor}")
 
             // обновляем список блокировки в фоне (не задерживая запуск туннеля)
             Thread {
@@ -620,17 +682,19 @@ class BlockVpnService : VpnService() {
             notifyHandler.removeCallbacks(blocklistCheckRunnable)
             notifyHandler.postDelayed(blocklistCheckRunnable, BLOCKLIST_CHECK_INTERVAL_MS)
 
-            // свежий поток на каждый запуск, чтобы повторный старт не упал
-            // с IllegalThreadStateException
-            Thread(::tunnelLoop).apply {
-                name = "AntiTrack-Tunnel"
-                isDaemon = true
-            }.start()
+            if (appliedMode == AppSettings.MODE_DNS) {
+                // свежий поток на каждый запуск, чтобы повторный старт не упал
+                // с IllegalThreadStateException
+                Thread(::tunnelLoop).apply {
+                    name = "AntiTrack-Tunnel"
+                    isDaemon = true
+                }.start()
 
-            Thread(::trafficWatcherLoop).apply {
-                name = "AntiTrack-TrafficWatcher"
-                isDaemon = true
-            }.start()
+                Thread(::trafficWatcherLoop).apply {
+                    name = "AntiTrack-TrafficWatcher"
+                    isDaemon = true
+                }.start()
+            }
 
             true
         }
@@ -640,26 +704,59 @@ class BlockVpnService : VpnService() {
             this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE
         )
+        appliedMode = AppSettings.blockMode()
+        // Если нативный стек недоступен (например, в APK нет библиотеки под
+        // ABI устройства), остаёмся с защитой: переключаемся на DNS-режим.
+        tunnelUnavailable = false
+        if (appliedMode == AppSettings.MODE_TUNNEL && !ensureNativeLoaded()) {
+            Log.e(TAG, "Полный туннель недоступен — запускаю DNS-режим")
+            appliedMode = AppSettings.MODE_DNS
+            tunnelUnavailable = true
+        }
         val builder = Builder()
             .setSession(getString(R.string.vpn_session_name))
             .setConfigureIntent(configureIntent)
-            .setMtu(MTU)
-            .addAddress(TUN_IP, TUN_PREFIX)
-            .addRoute(DNS_IP, DNS_ROUTE_PREFIX)
-            .addDnsServer(DNS_IP)
-            .addAddress(TUN_IP6, TUN_PREFIX6)
-            .addRoute(DNS_IP6, DNS_ROUTE_PREFIX6)
-            .addDnsServer(DNS_IP6)
-        // DoH/DoT не должен обходить фильтр: TCP и UDP к этим адресам уводятся
-        // в туннель, TCP там гаснет, а UDP:53 проходит наш DNS-фильтр.
-        for (ip in bypassDnsIps) builder.addRoute(ip, 32)
-        for (ip in bypassDnsIps6) builder.addRoute(ip, 128)
 
-        // Исключённые приложения выпускаем из VPN целиком. Свой пакет исключить
-        // нельзя, поэтому для него остаётся только логическая проверка в handlePacket.
+        if (appliedMode == AppSettings.MODE_TUNNEL) {
+            // Полный туннель: весь трафик проходит через userspace-стек,
+            // поэтому блокировать можно и по IP. MTU задаёт нативный стек
+            // (10 000, как в NetGuard).
+            val mtu = runCatching { jniGetMtu() }.getOrDefault(TUNNEL_MTU)
+            builder.setMtu(mtu)
+                .addAddress(TUN_IP, 32)
+                .addAddress(TUN_IP6, 128)
+                .addRoute("0.0.0.0", 0)
+                .addRoute("2000::", 3) // глобальный unicast IPv6
+
+            // Если выбран конкретный резолвер, сообщаем его системе. Для
+            // «системного» ничего не добавляем: Android возьмёт DNS текущей
+            // сети, а нативный стек всё равно перехватит и разберёт ответы.
+            for (ip in tunnelDnsServers()) {
+                try {
+                    builder.addDnsServer(ip)
+                } catch (e: IllegalArgumentException) {
+                    Log.w(TAG, "Некорректный DNS-сервер: $ip", e)
+                }
+            }
+        } else {
+            builder.setMtu(MTU)
+                .addAddress(TUN_IP, TUN_PREFIX)
+                .addRoute(DNS_IP, DNS_ROUTE_PREFIX)
+                .addDnsServer(DNS_IP)
+                .addAddress(TUN_IP6, TUN_PREFIX6)
+                .addRoute(DNS_IP6, DNS_ROUTE_PREFIX6)
+                .addDnsServer(DNS_IP6)
+            // DoH/DoT не должен обходить фильтр: TCP и UDP к этим адресам уводятся
+            // в туннель, TCP там гаснет, а UDP:53 проходит наш DNS-фильтр.
+            for (ip in bypassDnsIps) builder.addRoute(ip, 32)
+            for (ip in bypassDnsIps6) builder.addRoute(ip, 128)
+        }
+
+        // Исключённые приложения выпускаем из VPN целиком. Своё приложение тоже
+        // исключаем: в полном туннеле иначе его собственные сокеты (обновление
+        // списков, DNS нативного стека) уходили бы обратно в туннель.
         val excluded = excludedPackages()
         for (pkg in excluded) {
-            if (pkg == packageName) continue
             try {
                 builder.addDisallowedApplication(pkg)
             } catch (e: PackageManager.NameNotFoundException) {
@@ -673,9 +770,390 @@ class BlockVpnService : VpnService() {
         return builder.establish()
     }
 
+    /**
+     * DNS-серверы для режима полного туннеля: выбранный пользователем
+     * резолвер либо ничего для «системного».
+     */
+    private fun tunnelDnsServers(): List<String> {
+        val provider = DnsProviders.byId(AppSettings.dnsProviderId())
+        if (provider.id == DnsProviders.SYSTEM_ID) return emptyList()
+        if (provider.custom) {
+            return AppSettings.customDnsServers().filter { isNumericAddress(it) }.take(4)
+        }
+        return (provider.ipv4.take(2) + provider.ipv6.take(2))
+    }
+
     /** Приложения, которые не должны проходить через VPN. */
     private fun excludedPackages(): Set<String> =
         exemptPackages + PerAppSettings.disabledTrackerPackages()
+
+    // ———————————————————— полный туннель: нативный стек ————————————————————
+
+    /**
+     * Загружает userspace-стек NetGuard. Библиотека лежит в APK под именем
+     * `libantitrack_tunnel.so`; без неё режим полного туннеля недоступен, но
+     * DNS-режим продолжает работать.
+     */
+    private fun ensureNativeLoaded(): Boolean {
+        if (nativeLoaded) return true
+        return try {
+            System.loadLibrary("antitrack_tunnel")
+            nativeLoaded = true
+            true
+        } catch (e: UnsatisfiedLinkError) {
+            Log.e(TAG, "Не удалось загрузить нативный стек туннеля", e)
+            false
+        }
+    }
+
+    private fun ensureNativeContext(): Long {
+        if (!ensureNativeLoaded()) return 0L
+        if (nativeContext == 0L) {
+            nativeContext = try {
+                jniInit(Build.VERSION.SDK_INT)
+            } catch (e: Throwable) {
+                Log.e(TAG, "Не удалось создать контекст нативного стека", e)
+                0L
+            }
+        }
+        return nativeContext
+    }
+
+    /** Запускает обработку пакетов в нативном потоке (он блокирующий). */
+    private fun startNativeStack(tun: ParcelFileDescriptor) {
+        val ctx = ensureNativeContext()
+        if (ctx == 0L) {
+            Log.e(TAG, "Полный туннель недоступен: нативный стек не загрузился")
+            notifyHandler.post {
+                if (running) {
+                    teardown()
+                    stopSelf()
+                }
+            }
+            return
+        }
+        try {
+            jniStart(ctx, android.util.Log.WARN)
+        } catch (e: Throwable) {
+            Log.e(TAG, "Не удалось запустить нативный стек", e)
+            return
+        }
+        val thread = Thread({
+            Log.i(TAG, "Нативный стек запущен")
+            try {
+                // fwd53=false: DNS не перенаправляем на прокси, а пропускаем
+                // через защищённый сокет и разбираем ответы в dnsResolved.
+                jniRun(ctx, tun.fd, false, TUNNEL_RCODE)
+            } catch (e: Throwable) {
+                Log.e(TAG, "Нативный стек завершился с ошибкой", e)
+            } finally {
+                nativeThread = null
+                Log.i(TAG, "Нативный стек остановлен")
+                if (running) {
+                    // Стек завершился сам (не через teardown) — считаем, что
+                    // туннель потерян, и действуем как при отзыве VPN.
+                    notifyHandler.post {
+                        if (running) handleTunnelLoss()
+                    }
+                }
+            }
+        }, "AntiTrack-Native")
+        thread.isDaemon = true
+        nativeThread = thread
+        thread.start()
+    }
+
+    private fun stopNativeStack() {
+        val ctx = nativeContext
+        val thread = nativeThread
+        if (ctx != 0L) {
+            try {
+                jniStop(ctx)
+            } catch (e: Throwable) {
+                Log.w(TAG, "Ошибка остановки нативного стека", e)
+            }
+        }
+        if (thread != null && thread !== Thread.currentThread()) {
+            try {
+                thread.join(3_000)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+            }
+        }
+        nativeThread = null
+        if (ctx != 0L && (thread == null || !thread.isAlive)) {
+            try {
+                jniClear(ctx)
+            } catch (e: Throwable) {
+                Log.w(TAG, "Ошибка очистки нативного стека", e)
+            }
+        }
+        tunnelDns.clear()
+    }
+
+    private fun destroyNativeContext() {
+        val ctx = nativeContext
+        nativeContext = 0L
+        if (ctx != 0L) {
+            try {
+                jniDone(ctx)
+            } catch (e: Throwable) {
+                Log.w(TAG, "Ошибка освобождения нативного контекста", e)
+            }
+        }
+    }
+
+    // ———————— JNI-колбэки userspace-стека (вызываются из native) ————————
+
+    /** Владелец сокета по данным netd. Вызывается для каждого нового потока. */
+    @Keep
+    fun getUidQ(
+        version: Int,
+        protocol: Int,
+        saddr: String?,
+        sport: Int,
+        daddr: String?,
+        dport: Int
+    ): Int {
+        if (protocol != OsConstants.IPPROTO_TCP && protocol != OsConstants.IPPROTO_UDP) {
+            return Process.INVALID_UID
+        }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return Process.INVALID_UID
+        if (saddr.isNullOrBlank() || daddr.isNullOrBlank()) return Process.INVALID_UID
+        val cm = getSystemService(ConnectivityManager::class.java) ?: return Process.INVALID_UID
+        return try {
+            val local = InetSocketAddress(InetAddress.getByName(saddr), sport)
+            val remote = InetSocketAddress(InetAddress.getByName(daddr), dport)
+            cm.getConnectionOwnerUid(protocol, local, remote)
+        } catch (e: Exception) {
+            Process.INVALID_UID
+        }
+    }
+
+    /**
+     * Проверка имени из SNI. В туннельном режиме атрибуция делается по IP и
+     * UID, поэтому здесь всегда `false`: блокировка по SNI не нужна и только
+     * мешала бы точной статистике.
+     */
+    @Keep
+    fun isDomainBlocked(name: String?): Boolean = false
+
+    /**
+     * Блокировка по имени из DNS-ответа в полном туннеле. Сюда нативный стек
+     * передаёт UID запросившего приложения, поэтому учитываются per-app
+     * настройки, а статистика пишется сразу. При `true` native подменяет ответ
+     * на NXDOMAIN: приложение не получает IP и не открывает соединение — тот же
+     * барьер, что и в режиме «Только DNS», но без потери точной атрибуции.
+     */
+    @Keep
+    fun isDnsBlocked(name: String?, uid: Int, qname: String?): Boolean {
+        if (name.isNullOrBlank() || AppSettings.isPaused()) return false
+        val host = name.lowercase().trim().trimEnd('.')
+        if (host.isEmpty()) return false
+
+        val requested = qname?.lowercase()?.trim()?.trimEnd('.')
+        // Явное разрешение исходного имени сильнее CNAME-цели: пользователь
+        // разрешил сайт, а его A-запись пришла на сторонний CDN/трекер.
+        if (requested != null && requested != host && HostRules.isAllowed(requested)) return false
+
+        val app = if (uid >= 10_000) packageNameForUid(uid) else null
+        if (app != null && app in exemptPackages) return false
+        if (HostRules.isAllowed(host)) return false
+
+        val custom = HostRules.isBlocked(host)
+        // Per-app переключатель относится только к трекерам: рекламу глушим
+        // всегда, как и в DNS-режиме.
+        val tracker = if (AppSettings.blockTrackers() &&
+            (app == null || PerAppSettings.isTrackerBlockingEnabled(app))
+        ) TrackerBlocklist.findMatch(host) else null
+        val ads = if (AppSettings.blockAds()) AdBlocklist.findMatch(host) else null
+        if (!custom && tracker == null && ads == null) return false
+
+        val owner = app ?: BlockStats.OTHER
+        val kind: BlockStats.Kind
+        val status: RequestLog.Status
+        val pattern: String?
+        when {
+            custom -> {
+                kind = BlockStats.Kind.TRACKER
+                status = RequestLog.Status.CUSTOM_BLOCKED
+                pattern = null
+            }
+            tracker != null -> {
+                kind = BlockStats.Kind.TRACKER
+                status = RequestLog.Status.TRACKER
+                pattern = tracker
+            }
+            else -> {
+                kind = BlockStats.Kind.ADS
+                status = RequestLog.Status.ADS
+                pattern = ads
+            }
+        }
+
+        blockedCount.incrementAndGet()
+        BlockStats.record(owner, host, kind)
+        if (kind == BlockStats.Kind.TRACKER) applyThrottle(owner)
+        if (RequestLog.isEnabled) {
+            RequestLog.record(
+                owner,
+                host,
+                status,
+                null,
+                null,
+                pattern,
+                if (uid <= 0) RequestLog.Reason.UID_UNKNOWN else null
+            )
+        }
+        Log.d(TAG, "Туннель: DNS $host заблокирован ($kind) для $owner (uid $uid)")
+        return true
+    }
+
+    /**
+     * Решение по конкретному потоку. Native отдаёт точный UID соединения и
+     * адресата; домен берём из таблицы DNS-ответов. Возврат `null` — блокировка,
+     * [Allowed] — пропуск.
+     */
+    @Keep
+    fun isAddressAllowed(packet: Packet): Allowed? {
+        // Native не всегда может назвать владельца сокета: например, для
+        // непривязанного UDP-сокета getConnectionOwnerUid возвращает
+        // INVALID_UID. Второй шанс — таблица сокетов в /proc/net по локальному
+        // порту. Если и она не помогла, запрос честно уходит в «Другое».
+        val uid = if (packet.uid > 0) packet.uid else uidForSocket(packet)
+        if (uid <= 0) {
+            Log.d(
+                TAG,
+                "Туннель: UID не определён ${packet.saddr}:${packet.sport} -> " +
+                    "${packet.daddr}:${packet.dport} (p${packet.protocol}) — «Другое»"
+            )
+        }
+        val app = if (uid > 0) packageNameForUid(uid) else BlockStats.OTHER
+        val ip = packet.daddr
+
+        // Своё приложение и явно исключённые пакеты не фильтруем.
+        if (uid == Process.myUid() || app in exemptPackages) return Allowed()
+        if (AppSettings.isPaused()) return Allowed()
+        if (uid > 0 && !PerAppSettings.isTrackerBlockingEnabled(app)) return Allowed()
+
+        // Троттлинг: приложение недавно активно слало трекеры — на время
+        // отключаем ему весь трафик, включая DNS.
+        if (activeThrottles > 0 && isThrottled(app)) {
+            if (RequestLog.isEnabled) {
+                RequestLog.record(app, ip ?: "", RequestLog.Status.THROTTLE, null, ip, null)
+            }
+            return null
+        }
+
+        // DNS пропускаем всегда: его ответы наполняют таблицу IP → домен.
+        if (packet.dport == DNS_PORT) return Allowed()
+        if (ip.isNullOrBlank()) return Allowed()
+
+        // SNI из TLS ClientHello — точное имя соединения. Если он есть,
+        // используем только его, а не все домены, которые делят этот IP.
+        val sni = sniOf(packet)
+        // Явное разрешение хоста сильнее CNAME-цели из таблицы.
+        if (sni != null && HostRules.isAllowed(sni)) return Allowed()
+        val hosts = tunnelDns.hostsFor(ip, sni)
+        if (hosts.isEmpty()) return Allowed()
+
+        val blockTrackers = AppSettings.blockTrackers()
+        val blockAds = AppSettings.blockAds()
+        var trackerHit: String? = null
+        var adsHit: String? = null
+        val blockedHosts = HashSet<String>()
+
+        for (host in hosts) {
+            if (HostRules.isAllowed(host)) continue
+            if (HostRules.isBlocked(host)) {
+                blockedHosts.add(host)
+                if (trackerHit == null) trackerHit = host
+                continue
+            }
+            if (blockTrackers && TrackerBlocklist.findMatch(host) != null) {
+                blockedHosts.add(host)
+                if (trackerHit == null) trackerHit = host
+                continue
+            }
+            if (blockAds && AdBlocklist.findMatch(host) != null) {
+                blockedHosts.add(host)
+                if (adsHit == null) adsHit = host
+            }
+        }
+
+        if (blockedHosts.isEmpty()) return Allowed()
+
+        // Общий IP: рядом с трекером живут обычные домены. По умолчанию
+        // пропускаем такой поток, иначе ломаются CDN и крупные сервисы.
+        // Но если нативный стек уже распознал SNI, домен точный — правило
+        // общих IP к нему не применяем.
+        if (sni == null && blockedHosts.size < hosts.size && !AppSettings.tunnelStrictIp()) {
+            return Allowed()
+        }
+
+        val host = trackerHit ?: adsHit ?: return Allowed()
+        val kind = if (trackerHit != null) BlockStats.Kind.TRACKER else BlockStats.Kind.ADS
+        blockedCount.incrementAndGet()
+        // В туннеле UID точный: пишем ровно то приложение, которому
+        // принадлежит соединение. База связей здесь не подменяет владельца —
+        // иначе «точное определение» перестаёт быть точным. Незнакомую пару
+        // UI помечает звёздочкой и показывает сырой домен.
+        BlockStats.record(app, host, kind)
+        if (kind == BlockStats.Kind.TRACKER) applyThrottle(app)
+        if (RequestLog.isEnabled) {
+            RequestLog.record(
+                app,
+                host,
+                if (kind == BlockStats.Kind.TRACKER) RequestLog.Status.TRACKER else RequestLog.Status.ADS,
+                null,
+                ip,
+                host,
+                if (uid <= 0) RequestLog.Reason.UID_UNKNOWN else null
+            )
+        }
+        Log.d(TAG, "Туннель: заблокирован $host ($kind) для $app ($ip)")
+        return null
+    }
+
+    /**
+     * SNI из TLS ClientHello, который нативный стек положил в [Packet.data].
+     * Для ICMP там лежит «type X/Y», для обычных пакетов — пусто. SNI без
+     * точки не считаем доменом: списки всё равно работают по FQDN.
+     */
+    private fun sniOf(packet: Packet): String? =
+        packet.data?.trim()?.takeIf {
+            it.isNotEmpty() && !it.startsWith("type ") && !it.contains(' ') && it.contains('.')
+        }
+
+    /** Ответ DNS (или SNI), разобранный нативным стеком: IP → домен. */
+    @Keep
+    fun dnsResolved(rr: ResourceRecord) {
+        val ip = rr.Resource
+        val qname = rr.QName
+        if (ip.isNullOrBlank() || qname.isNullOrBlank()) return
+        // TTL = -1 приходит для SNI: срок жизни такого соответствия неизвестен,
+        // но соединение реальное, поэтому держим запись несколько минут.
+        val ttl = if (rr.TTL > 0) rr.TTL else SNI_MAPPING_TTL_SEC
+        val time = if (rr.Time > 0) rr.Time else System.currentTimeMillis()
+        tunnelDns.record(ip, qname, rr.AName, time, ttl)
+    }
+
+    /** Native просит залогировать пакет (используется только для pcap). */
+    @Keep
+    fun logPacket(packet: Packet) = Unit
+
+    @Keep
+    fun accountUsage(usage: Usage) = Unit
+
+    @Keep
+    fun nativeExit(reason: String?) {
+        Log.w(TAG, "Нативный стек сообщил о завершении: $reason")
+    }
+
+    @Keep
+    fun nativeError(error: Int, message: String?) {
+        Log.w(TAG, "Ошибка нативного стека $error: $message")
+    }
 
     private fun teardown() {
         synchronized(lifecycleLock) {
@@ -704,6 +1182,9 @@ class BlockVpnService : VpnService() {
             diagnosticsPool?.shutdownNow()
             diagnosticsPool = null
             dnsCache.clear()
+            // Нативный стек должен отпустить сессии и сокеты до закрытия
+            // tуннеля, иначе его epoll останется на закрытом дескрипторе.
+            stopNativeStack()
             try {
                 tunnel?.close()
             } catch (e: IOException) {
@@ -1409,9 +1890,20 @@ class BlockVpnService : VpnService() {
             }
             val owner = appRule ?: BlockStats.OTHER
             blockedCount.incrementAndGet()
-            BlockStats.record(owner, qname, BlockStats.Kind.TRACKER)
+            val statsOwner = AppTrackerMap.statsOwner(owner, qname)
+            BlockStats.record(statsOwner, qname, BlockStats.Kind.TRACKER)
             Log.d(TAG, "Заблокировано пользователем: $qname")
-            if (logging) RequestLog.record(owner, qname, RequestLog.Status.CUSTOM_BLOCKED, srcIpStr, dstIpStr, qname)
+            if (logging) {
+                RequestLog.record(
+                    statsOwner,
+                    qname,
+                    RequestLog.Status.CUSTOM_BLOCKED,
+                    srcIpStr,
+                    dstIpStr,
+                    qname,
+                    reasonFor(owner, statsOwner)
+                )
+            }
             buildBlockResponse(packet, dnsStart, len)?.let {
                 writeDnsResponse(srcIp, dstIp, srcPort, it)
             }
@@ -1444,14 +1936,36 @@ class BlockVpnService : VpnService() {
                     val isTracker = trackersMatch
                     val kind = if (isTracker) BlockStats.Kind.TRACKER else BlockStats.Kind.ADS
                     blockedCount.incrementAndGet()
-                    BlockStats.record(owner, qname, kind)
+                    // База связей: подтверждённая пара остаётся у приложения,
+                    // а заведомо чужие трекеры уходят в «Другое».
+                    val statsOwner = AppTrackerMap.statsOwner(owner, qname)
+                    BlockStats.record(statsOwner, qname, kind)
                     Log.d(TAG, "Заблокировано: $qname (${kind.name})")
                     val pattern = if (isTracker) trackerMatch else adsMatch
                     if (isTracker) {
-                        applyThrottle(owner)
-                        if (logging) RequestLog.record(owner, qname, RequestLog.Status.TRACKER, srcIpStr, dstIpStr, pattern)
+                        // Троттлинг — только если трекер действительно
+                        // принадлежит приложению. Иначе из-за ошибочной пары
+                        // можно целиком отключить интернет невиновному app.
+                        if (statsOwner != BlockStats.OTHER) applyThrottle(owner)
+                        if (logging) RequestLog.record(
+                            statsOwner,
+                            qname,
+                            RequestLog.Status.TRACKER,
+                            srcIpStr,
+                            dstIpStr,
+                            pattern,
+                            reasonFor(owner, statsOwner)
+                        )
                     } else if (logging) {
-                        RequestLog.record(owner, qname, RequestLog.Status.ADS, srcIpStr, dstIpStr, pattern)
+                        RequestLog.record(
+                            statsOwner,
+                            qname,
+                            RequestLog.Status.ADS,
+                            srcIpStr,
+                            dstIpStr,
+                            pattern,
+                            reasonFor(owner, statsOwner)
+                        )
                     }
                     // NXDOMAIN вместо «тишины»: клиент завершает запрос сразу, без
                     // таймаута и повторов, которые могли бы «проскочить» мимо фильтра.
@@ -1553,6 +2067,19 @@ class BlockVpnService : VpnService() {
                 ?: BlockStats.OTHER
         }
         return raw
+    }
+
+    /**
+     * Причина, по которой запись в логе оказалась без точного приложения.
+     * В DNS-режиме запрос часто уходит через системный резолвер (netd): сокет
+     * принадлежит системе, и авторство приходится угадывать по активности.
+     * Если же приложение определено, но база связей сочла трекер чужим, это
+     * уже не «неизвестно кто», а осознанная переатрибуция в «Другое».
+     */
+    private fun reasonFor(owner: String, statsOwner: String): RequestLog.Reason? = when {
+        owner == BlockStats.OTHER -> RequestLog.Reason.SYSTEM_RESOLVER
+        statsOwner == BlockStats.OTHER -> RequestLog.Reason.DB_MISATTRIBUTION
+        else -> null
     }
 
     /**
@@ -1780,16 +2307,43 @@ class BlockVpnService : VpnService() {
         }
     }
 
-    private fun uidForSourcePort(sourcePort: Int): Int {
+    /**
+     * UID владельца пакета по таблице сокетов. Нужен как запасной сигнал,
+     * когда нативный стек не смог получить владельца через
+     * [ConnectivityManager.getConnectionOwnerUid] (чаще всего — непривязанные
+     * UDP-сокеты и QUIC). На новых прошивках /proc/net может быть частично
+     * скрыт, тогда просто возвращаем -1 и решение остаётся за вызывающим.
+     */
+    private fun uidForSocket(packet: Packet): Int =
+        uidForSourcePort(packet.sport, packet.protocol, packet.dport)
+
+    private fun uidForSourcePort(
+        sourcePort: Int,
+        protocol: Int = OsConstants.IPPROTO_UDP,
+        destPort: Int = 0
+    ): Int {
+        if (sourcePort <= 0) return -1
+        val files = when (protocol) {
+            OsConstants.IPPROTO_TCP -> listOf("/proc/net/tcp", "/proc/net/tcp6")
+            OsConstants.IPPROTO_UDP -> listOf("/proc/net/udp", "/proc/net/udp6")
+            else -> return -1
+        }
         val portHex = String.format(Locale.ROOT, "%04X", sourcePort)
-        for (procPath in listOf("/proc/net/udp", "/proc/net/udp6")) {
+        for (procPath in files) {
             try {
                 File(procPath).readLines().forEach { line ->
                     val parts = line.trim().split(Regex("\\s+"))
-                    if (parts.size > 8 && parts[1].endsWith(":$portHex")) {
-                        val uid = parts[7].toIntOrNull()
-                        if (uid != null) return uid
+                    if (parts.size <= 8 || !parts[1].endsWith(":$portHex")) {
+                        return@forEach
                     }
+                    // У несвязанного UDP-сокета удалённый порт нулевой, поэтому
+                    // сравниваем только когда он известен.
+                    val remotePort = parts[2].substringAfterLast(':').toIntOrNull(16) ?: 0
+                    if (destPort > 0 && remotePort != 0 && remotePort != destPort) {
+                        return@forEach
+                    }
+                    val uid = parts[7].toIntOrNull()
+                    if (uid != null) return uid
                 }
             } catch (e: IOException) {
                 Log.w(TAG, "Не удалось прочитать $procPath", e)
@@ -1983,17 +2537,21 @@ class BlockVpnService : VpnService() {
 
         val owner = app
         blockedCount.incrementAndGet()
-        BlockStats.record(owner, qname, kind)
+        // Для CNAME статистика хранит исходный qname, а проверять базу связей
+        // нужно по реальному трекеру из цепочки.
+        val statsOwner = AppTrackerMap.statsOwner(owner, target)
+        BlockStats.record(statsOwner, qname, kind)
         val pattern = "CNAME $target"
         if (RequestLog.isEnabled) {
             RequestLog.record(
-                owner,
+                statsOwner,
                 qname,
                 if (kind == BlockStats.Kind.TRACKER) RequestLog.Status.TRACKER
                 else RequestLog.Status.ADS,
                 ipToString(srcIp),
                 ipToString(dstIp),
-                pattern
+                pattern,
+                reasonFor(owner, statsOwner)
             )
         }
         Log.d(TAG, "Заблокировано по CNAME: $qname -> $target")

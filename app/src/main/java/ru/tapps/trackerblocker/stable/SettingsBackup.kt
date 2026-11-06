@@ -29,6 +29,8 @@ object SettingsBackup {
         val settings = JSONObject()
             .put("blockTrackers", AppSettings.blockTrackers())
             .put("blockAds", AppSettings.blockAds())
+            .put("blockMode", AppSettings.blockMode())
+            .put("tunnelStrictIp", AppSettings.tunnelStrictIp())
             .put("dnsProvider", AppSettings.dnsProviderId())
             .put("customDns", AppSettings.customDnsRaw())
             .put("dnsEncrypt", AppSettings.dnsEncryptionEnabled())
@@ -86,6 +88,13 @@ object SettingsBackup {
             }
             if (settings.has("blockAds")) {
                 AppSettings.setBlockAds(settings.optBoolean("blockAds"))
+            }
+            val mode = settings.optString("blockMode", "")
+            if (mode == AppSettings.MODE_DNS || mode == AppSettings.MODE_TUNNEL) {
+                AppSettings.setBlockMode(mode)
+            }
+            if (settings.has("tunnelStrictIp")) {
+                AppSettings.setTunnelStrictIp(settings.optBoolean("tunnelStrictIp"))
             }
             val provider = settings.optString("dnsProvider", "")
             if (provider.isNotEmpty() && DnsProviders.all.any { it.id == provider }) {

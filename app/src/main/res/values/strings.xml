@@ -61,6 +61,7 @@
     <string name="stats_usage_access_hint">Для точной статистики разрешите «Доступ к использованию приложений», иначе блокировки будут писаться в «Систему»</string>
     <string name="dialog_close">Закрыть</string>
     <string name="stats_possible_misattribution">* - возможно ошибочное определение</string>
+    <string name="stats_other_note">Сюда попадают запросы, которые не удалось достоверно связать с приложением: системный DNS в режиме «Только DNS», сокеты без известного владельца (непривязанный UDP/QUIC, ICMP) и трекеры, которых нет в известном списке приложения. Это не отдельное приложение.</string>
     <string name="stats_meta_affiliation_note">** - продукт компании Meta, деятельность которой признана экстремистской и запрещена в России</string>
 
     <string name="update_available_title">Доступно обновление</string>
@@ -111,6 +112,10 @@
     <string name="logs_details_status">Статус</string>
     <string name="logs_details_pattern">Правило блокировки</string>
     <string name="logs_details_pattern_none">Не заблокирован по встроенному списку</string>
+    <string name="logs_details_reason">Причина</string>
+    <string name="logs_reason_uid_unknown">Не удалось определить владельца соединения: система вернула недействительный uid, а таблица сокетов недоступна. Поток записан в «Другое».</string>
+    <string name="logs_reason_system_resolver">Запрос пришёл через системный резолвер: DNS-сокет принадлежит системе, поэтому приложение определено приблизительно. Это поведение режима «Только DNS».</string>
+    <string name="logs_reason_db_misattribution">Приложение определено, но трекер отсутствует в его известном списке (или принадлежит другой компании по базе связей). Запись отнесена к «Другому», чтобы не приписывать её этому приложению.</string>
     <string name="logs_block_host">Блокировать %1$s</string>
     <string name="logs_allow_host">В следующий раз не блокировать %1$s</string>
     <string name="logs_close">Закрыть</string>
@@ -118,6 +123,16 @@
 
     <!-- Раздел настроек -->
     <string name="settings_section_protection">Защита</string>
+    <string name="settings_section_block_mode">Режим блокировки</string>
+    <string name="settings_mode_dns">Только DNS</string>
+    <string name="settings_mode_dns_hint">В туннель уходят только DNS-запросы, остальной трафик идёт напрямую. Более лёгкий режим, но приложение может определяться менее точно, а прямые соединения по IP не фильтруются.</string>
+    <string name="settings_mode_tunnel">Полный туннель</string>
+    <string name="settings_mode_tunnel_hint">Подходит для повседневного использования: блокирует и на уровне DNS-ответа, и прямые соединения по IP. Расход батареи выше, скорость может быть немного ниже.</string>
+    <string name="settings_tunnel_unavailable">Полный туннель недоступен на этом устройстве: нативная библиотека не загрузилась, работает режим «Только DNS». Подробности — в logcat по тегу BlockVpnService.</string>
+    <string name="settings_tunnel_dns_note">В полном туннеле DNS идёт без DoT: иначе ответы нельзя разобрать и сопоставить домены с IP. «Частный DNS» Android тоже скрывает имена — для полной блокировки выберите «Авто» или отключите его.</string>
+    <string name="settings_tunnel_strict_ip">Строгая блокировка общих IP</string>
+    <string name="settings_tunnel_strict_ip_hint">Блокировать адрес уже на этапе SYN, если на нём вместе с трекером живут обычные домены. Наружу не уходит даже попытка соединения, но выше риск сломать сайты и приложения на общих CDN.</string>
+    <string name="settings_block_mode_restart_hint">Смена режима перезапускает VPN. При активном «Частном DNS» (DoT) часть доменов в полном туннеле останется неизвестной.</string>
     <string name="settings_section_dns">DNS-сервер</string>
     <string name="settings_dns_hint">Разрешённые запросы пересылаются выбранному серверу. «Системный» использует DNS вашей Wi-Fi или мобильной сети — это быстрее всего и не ломает локальные имена.</string>
     <string name="settings_dns_system">Системный (по умолчанию)</string>
@@ -166,6 +181,8 @@
     <!-- Экран блоклистов -->
     <string name="blocklists_title">Блоклисты</string>
     <string name="blocklists_back">Назад</string>
+    <string name="blocklists_tab_lists">Списки</string>
+    <string name="blocklists_tab_links">Связи</string>
     <string name="blocklists_autoupdate_all">Автообновление списков</string>
     <string name="blocklists_autoupdate_all_hint">Если выключить, списки будут обновляться только вручную.</string>
     <string name="blocklists_trackers">Трекеры</string>
@@ -184,6 +201,23 @@
     <string name="blocklists_not_found">Ничего не найдено</string>
     <string name="blocklists_update_done">Список обновлён</string>
     <string name="blocklists_update_failed">Не удалось обновить список</string>
+
+    <!-- Связи «трекер ↔ приложение» -->
+    <string name="links_hint">Встроенная база: какие трекеры точно встречаются в приложениях. Для подтверждённых пар в статистике не показывается «возможно ошибочное определение». Трекеры, помеченные только за другими приложениями, и незнакомые трекеры у приложений с полным списком учитываются в «Другом».</string>
+    <string name="links_source">Встроенная база, версия %1$d</string>
+    <string name="links_by_app">По приложениям</string>
+    <string name="links_by_tracker">По трекерам</string>
+    <string name="links_search_app">Поиск по приложению или пакету</string>
+    <string name="links_search_tracker">Поиск по трекеру или приложению</string>
+    <string name="links_complete">Только эти трекеры — список полный</string>
+    <string name="links_incomplete">Известные трекеры — список неполный</string>
+    <string name="links_exclusive">Только в этих приложениях</string>
+    <string name="links_company">компания</string>
+    <string name="links_no_trackers">Трекеров не обнаружено</string>
+    <string name="links_no_known">Известных трекеров нет</string>
+    <string name="links_apps_count">Приложений: %1$d</string>
+    <string name="links_empty">Встроенная база связей пуста</string>
+    <string name="links_not_found">Ничего не найдено</string>
 
     <!-- Резервная копия -->
     <string name="settings_section_backup">Резервная копия</string>

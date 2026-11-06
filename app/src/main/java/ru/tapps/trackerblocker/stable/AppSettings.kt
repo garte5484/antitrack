@@ -24,6 +24,17 @@ object AppSettings {
     private const val KEY_DNS_CUSTOM = "dns_custom_servers"
     private const val KEY_DNS_ENCRYPT = "dns_encrypt"
     private const val KEY_BLOCK_RESPONSE_NULL = "block_response_null"
+    private const val KEY_BLOCK_MODE = "block_mode"
+    private const val KEY_TUNNEL_STRICT_IP = "tunnel_strict_ip"
+
+    /**
+     * Режим блокировки:
+     *  - [MODE_DNS] — в туннель уходит только DNS (лёгкий, TCP напрямую);
+     *  - [MODE_TUNNEL] — весь трафик идёт через userspace-стек, поэтому
+     *    приложение-владелец соединения определяется точно.
+     */
+    const val MODE_DNS = "dns"
+    const val MODE_TUNNEL = "tunnel"
 
     // Результаты последней попытки автозапуска. Нужны, чтобы в настройках
     // было видно, дошёл ли до приложения BOOT_COMPLETED и удалось ли поднять
@@ -45,6 +56,26 @@ object AppSettings {
     fun blockTrackers(): Boolean = prefs?.getBoolean(KEY_BLOCK_TRACKERS, true) ?: true
 
     fun blockAds(): Boolean = prefs?.getBoolean(KEY_BLOCK_ADS, true) ?: true
+
+    /** Выбранный режим блокировки; по умолчанию — лёгкий DNS-режим. */
+    fun blockMode(): String =
+        prefs?.getString(KEY_BLOCK_MODE, MODE_DNS) ?: MODE_DNS
+
+    fun setBlockMode(mode: String) {
+        prefs?.edit()?.putString(KEY_BLOCK_MODE, mode)?.apply()
+    }
+
+    /**
+     * В режиме полного туннеля блокировать IP, к которому привязано несколько
+     * доменов, если хотя бы один из них трекер. Выключено по умолчанию:
+     * общие IP (CDN, Google, Meta) иначе дают ложные блокировки.
+     */
+    fun tunnelStrictIp(): Boolean =
+        prefs?.getBoolean(KEY_TUNNEL_STRICT_IP, false) ?: false
+
+    fun setTunnelStrictIp(enabled: Boolean) {
+        prefs?.edit()?.putBoolean(KEY_TUNNEL_STRICT_IP, enabled)?.apply()
+    }
 
     fun setBlockTrackers(enabled: Boolean) {
         prefs?.edit()?.putBoolean(KEY_BLOCK_TRACKERS, enabled)?.apply()

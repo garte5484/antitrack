@@ -80,6 +80,12 @@ internal object BrandNames {
         Brand(Color(0xFF3FA796), "S", "Segment", R.drawable.ic_brand_segment) {
             it.contains("segment")
         },
+        Brand(Color(0xFF3FA796), "H", "HeyTap", null) {
+            it.contains("heytap")
+        },
+        Brand(Color(0xFF3FA796), "C", "HeyTap", null) {
+            it.contains("heytap")
+        },
 
         // — соцсети и реклама —
         Brand(Color(0xFFFE2C55), "T", "TikTok", R.drawable.ic_brand_tiktok) {
